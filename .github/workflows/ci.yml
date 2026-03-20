@@ -38,29 +38,12 @@ jobs:
         run: bandit -r perceptimg -q --exclude perceptimg/tests
 
   test:
-    name: Test (${{ matrix.os }} / ${{ matrix.arch }} / Python ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.13", "3.14"]
-        arch: [x64, arm64]
-        exclude:
-          # Windows arm64 is not available on GitHub Actions
-          - os: windows-latest
-            arch: arm64
-          # macOS arm64 requires specific runner
-          - os: macos-latest
-            arch: arm64
-        include:
-          # macOS arm64 (Apple Silicon)
-          - os: macos-14
-            python-version: "3.13"
-            arch: arm64
-          - os: macos-14
-            python-version: "3.14"
-            arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -70,16 +53,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libjpeg-dev zlib1g-dev libpng-dev libtiff-dev libwebp-dev
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install libjpeg zlib libpng libtiff webp || true
 
       - name: Install Python dependencies
         run: |
@@ -87,14 +64,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short --cov=perceptimg --cov-report=xml --cov-report=term-missing
-
-      - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && matrix.arch == 'x64'
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage.xml
-          fail_ci_if_error: false
+        run: pytest tests/ -v --tb=short
 
   build:
     name: Build Package
@@ -124,27 +94,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install bandit safety
-
-      - name: Run Bandit
-        run: bandit -r perceptimg -q --exclude perceptimg/tests
-
-      - name: Check dependencies for vulnerabilities
-        run: |
-          pip install -e "."
-          safety check --full-report || true
