@@ -7,12 +7,12 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     """Status of a distributed job."""
 
     QUEUED = "queued"

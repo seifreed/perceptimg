@@ -9,12 +9,12 @@ import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     """Status of a batch processing job."""
 
     PENDING = "pending"

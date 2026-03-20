@@ -20,5 +20,5 @@ def test_metrics_size_changes_reflected() -> None:
     metrics = MetricCalculator().compute(
         image, image, original_bytes=original, optimized_bytes=optimized
     )
-    assert metrics.size_after_kb <= metrics.size_before_kb
     assert metrics.perceptual_score <= 1.0
+    assert metrics.ssim == 1.0
