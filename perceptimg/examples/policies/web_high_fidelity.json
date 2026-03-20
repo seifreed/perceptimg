@@ -1,0 +1,9 @@
+{
+  "max_size_kb": 250,
+  "min_ssim": 0.97,
+  "preserve_text": true,
+  "preserve_faces": true,
+  "allow_lossy": true,
+  "preferred_formats": ["webp", "avif", "jpeg"],
+  "target_use_case": "web"
+}

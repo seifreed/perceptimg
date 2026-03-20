@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perceptimg"
+version = "0.1.0"
+description = "Perceptual, policy-driven image optimization engine for modern workflows"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Marc Rivero Lopez", email = "mriverolopez@gmail.com"}]
+maintainers = [{name = "Marc Rivero Lopez", email = "mriverolopez@gmail.com"}]
+keywords = [
+    "image",
+    "optimization",
+    "compression",
+    "perceptual",
+    "ssim",
+    "psnr",
+    "webp",
+    "avif",
+    "jpeg-xl",
+    "heif",
+    "batch-processing",
+    "policy-driven",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+    "Framework :: AsyncIO",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "scikit-image>=0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "black>=24.0",
+    "mypy>=1.8",
+    "bandit>=1.7",
+]
+redis = [
+    "redis>=4.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/seifreed/perceptimg"
+Documentation = "https://github.com/seifreed/perceptimg#readme"
+Repository = "https://github.com/seifreed/perceptimg"
+Issues = "https://github.com/seifreed/perceptimg/issues"
+Changelog = "https://github.com/seifreed/perceptimg/releases"
+Funding = "https://buymeacoffee.com/seifreed"
+
+[project.scripts]
+perceptimg = "perceptimg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perceptimg*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "W", "I", "UP", "C4"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+strict = true
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["perceptimg"]
+branch = true
+omit = ["tests/*", "perceptimg/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", "perceptimg/tests"]

@@ -1,0 +1,9 @@
+{
+  "max_size_kb": null,
+  "min_ssim": 0.99,
+  "preserve_text": true,
+  "preserve_faces": true,
+  "allow_lossy": false,
+  "preferred_formats": ["png", "avif"],
+  "target_use_case": "print"
+}

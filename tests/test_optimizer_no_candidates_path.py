@@ -1,0 +1,29 @@
+import pytest
+from PIL import Image
+
+from perceptimg import Policy
+from perceptimg.core.optimizer import Optimizer
+from perceptimg.core.strategy import StrategyCandidate
+from perceptimg.engines.base import EngineResult, OptimizationEngine
+from perceptimg.exceptions import OptimizationError
+
+
+class RejectingEngine(OptimizationEngine):
+    format = "jpeg"
+
+    def can_handle(self, fmt: str) -> bool:
+        return fmt == "jpeg"
+
+    def optimize(self, image: Image.Image, strategy: StrategyCandidate) -> EngineResult:
+        from perceptimg.utils.image_io import image_to_bytes
+
+        data = image_to_bytes(image, format="PNG")
+        return EngineResult(data=data, format="jpeg", quality=strategy.quality, metadata={})
+
+
+def test_optimizer_no_candidates_raise() -> None:
+    optimizer = Optimizer(engines=[RejectingEngine()])
+    image = Image.new("RGB", (8, 8), "white")
+    policy = Policy(max_size_kb=0.0001, min_ssim=1.0, preferred_formats=("jpeg",))
+    with pytest.raises(OptimizationError):
+        optimizer.optimize_from_analysis(image, optimizer.analyzer.analyze(image), policy)
