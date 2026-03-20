@@ -13,7 +13,7 @@
   <a href="https://pypi.org/project/perceptimg/"><img src="https://img.shields.io/pypi/pyversions/perceptimg?style=flat-square&logo=python&logoColor=white" alt="Python Versions"></a>
   <a href="https://github.com/seifreed/perceptimg/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
   <a href="https://github.com/seifreed/perceptimg/actions"><img src="https://img.shields.io/github/actions/workflow/status/seifreed/perceptimg/ci.yml?style=flat-square&logo=github&label=CI" alt="CI Status"></a>
-  <img src="https://img.shields.io/badge/coverage-100%25-brightgreen?style=flat-square" alt="Coverage">
+  <a href="https://codecov.io/gh/seifreed/perceptimg"><img src="https://codecov.io/gh/seifreed/perceptimg/branch/main/graph/badge.svg?style=flat-square" alt="Coverage"></a>
 </p>
 
 <p align="center">
@@ -366,7 +366,7 @@ class CustomAnalyzer(Analyzer):
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.13+
 - Pillow (PIL fork)
 - NumPy
 - scikit-image
