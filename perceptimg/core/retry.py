@@ -6,13 +6,13 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any, TypeVar
 
 T = TypeVar("T")
 
 
-class RetryDecision(str, Enum):
+class RetryDecision(StrEnum):
     """Decision after an error."""
 
     RETRY = "retry"
