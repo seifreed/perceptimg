@@ -49,22 +49,27 @@ class PILImageAdapter:
     @property
     def size(self) -> tuple[int, int]:
         """Image dimensions as (width, height)."""
-        return self._image.size
+        w: int = self._image.width
+        h: int = self._image.height
+        return (w, h)
 
     @property
     def mode(self) -> str:
         """Image color mode (e.g., 'RGB', 'RGBA', 'L')."""
-        return self._image.mode
+        mode: str = self._image.mode
+        return mode
 
     @property
     def width(self) -> int:
         """Image width in pixels."""
-        return self._image.width
+        w: int = self._image.width
+        return w
 
     @property
     def height(self) -> int:
         """Image height in pixels."""
-        return self._image.height
+        h: int = self._image.height
+        return h
 
     def convert(self, mode: str) -> PILImageAdapter:
         """Convert image to a different color mode.
