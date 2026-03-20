@@ -111,17 +111,11 @@ jobs:
       matrix:
         include:
           - python-version: "3.13"
-            arch: x64
-            runner: macos-13
-          - python-version: "3.14"
-            arch: x64
-            runner: macos-13
-          - python-version: "3.13"
             arch: arm64
-            runner: macos-14
+            runner: macos-latest
           - python-version: "3.14"
             arch: arm64
-            runner: macos-14
+            runner: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -130,10 +124,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install system dependencies
-        run: |
-          brew install libjpeg zlib libpng libtiff webp || true
 
       - name: Install Python dependencies
         run: |
