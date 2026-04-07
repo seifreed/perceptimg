@@ -21,7 +21,11 @@ class SimpleEngine(OptimizationEngine):
 
 def test_optimizer_accepts_when_policy_allows() -> None:
     optimizer = Optimizer(engines=[SimpleEngine()])
-    image = Image.new("RGB", (8, 8), "white")
+    image = Image.new("RGB", (64, 64), "white")
     policy = Policy(max_size_kb=None, min_ssim=None, preferred_formats=("jpeg",))
-    result = optimizer.optimize_from_analysis(image, optimizer.analyzer.analyze(image), policy)
+    # Use uncompressed PNG as original so JPEG output is smaller
+    original_bytes = image_to_bytes(image, format="PNG", save_kwargs={"compress_level": 0})
+    result = optimizer.optimize_from_analysis(
+        image, optimizer.analyzer.analyze(image), policy, original_bytes=original_bytes
+    )
     assert result.image_bytes

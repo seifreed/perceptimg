@@ -10,4 +10,4 @@ def test_perceptual_score_zero_after_bytes() -> None:
     optimized = b""
     calc = MetricCalculator()
     result = calc.compute(image, image, original_bytes=original, optimized_bytes=optimized)
-    assert result.perceptual_score >= 0.0
+    assert result.perceptual_score == -float("inf")  # 0-byte output is invalid and penalized

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 from collections.abc import Iterable, Sequence
@@ -42,7 +43,6 @@ class Optimizer:
     """Coordinates analysis, strategy generation, encoding, and selection."""
 
     _registry_lock = threading.Lock()
-    _thread_local = threading.local()
 
     def __init__(
         self,
@@ -52,6 +52,7 @@ class Optimizer:
         heuristic_config: heuristics.HeuristicConfig | None = None,
         prioritize_quality: bool = False,
     ) -> None:
+        self._thread_local = threading.local()
         base_engines = engines or [
             JxlEngine(),
             AvifEngine(),
@@ -78,21 +79,64 @@ class Optimizer:
         errors = getattr(self._thread_local, "errors", None)
         if errors is None:
             self._thread_local.errors = []
-            return []
-        return list(errors)
+        return self._thread_local.errors
 
     @_last_engine_errors.setter
     def _last_engine_errors(self, value: list[str]) -> None:
         self._thread_local.errors = value
+
+    def _build_passthrough_result(
+        self,
+        original_image: Image.Image,
+        original_bytes: bytes,
+        policy: Policy,
+        analysis: AnalysisResult,
+        *,
+        fallback_format: str | None = None,
+    ) -> OptimizationResult | None:
+        """Return the original image unchanged when no optimization improves size.
+
+        Returns None if the original itself violates policy constraints like
+        max_size_kb, so the caller can raise an appropriate error.
+        """
+        size_kb = len(original_bytes) / 1024.0
+        if policy.max_size_kb is not None and size_kb > policy.max_size_kb:
+            return None
+        original_format = (original_image.format or fallback_format or "png").lower()
+        perceptual_score = self.metric_calculator._perceptual_score(1.0, size_kb, size_kb)
+        report = OptimizationReport(
+            chosen_format=original_format,
+            quality=None,
+            size_before_kb=size_kb,
+            size_after_kb=size_kb,
+            ssim=1.0,
+            psnr=100.0,
+            perceptual_score=perceptual_score,
+            reasons=["already_optimal"],
+            policy=policy,
+            analysis=analysis,
+        )
+        return OptimizationResult(
+            image_bytes=original_bytes,
+            image=original_image,
+            report=report,
+        )
 
     def optimize(self, image_path: str | Path, policy: Policy) -> OptimizationResult:
         self._last_engine_errors = []
         original_bytes = Path(image_path).read_bytes()
         original_image = load_image(image_path)
         analysis = self.analyzer.analyze(original_image)
-        strategies = self.strategy_generator.generate(policy, analysis)
+        strategies = self._generate_strategies(policy, analysis)
         candidates = self._evaluate_candidates(original_image, original_bytes, strategies, policy)
         if not candidates:
+            if self._all_rejected_larger:
+                passthrough = self._build_passthrough_result(
+                    original_image, original_bytes, policy, analysis,
+                    fallback_format=Path(image_path).suffix.lstrip("."),
+                )
+                if passthrough is not None:
+                    return passthrough
             error_msg = "No candidate met policy requirements"
             if self._last_engine_errors:
                 error_msg += f". Engine errors: {'; '.join(self._last_engine_errors)}"
@@ -129,9 +173,15 @@ class Optimizer:
         """Optimize using a precomputed analysis (public API)."""
         self._last_engine_errors = []
         bytes_in = original_bytes or image_io.image_to_bytes(image, format="PNG")
-        strategies = self.strategy_generator.generate(policy, analysis_result)
+        strategies = self._generate_strategies(policy, analysis_result)
         candidates = self._evaluate_candidates(image, bytes_in, strategies, policy)
         if not candidates:
+            if self._all_rejected_larger:
+                passthrough = self._build_passthrough_result(
+                    image, bytes_in, policy, analysis_result
+                )
+                if passthrough is not None:
+                    return passthrough
             error_msg = "No candidate met policy requirements"
             if self._last_engine_errors:
                 error_msg += f". Engine errors: {'; '.join(self._last_engine_errors)}"
@@ -157,6 +207,27 @@ class Optimizer:
             report=report,
         )
 
+    def _generate_strategies(
+        self, policy: Policy, analysis: AnalysisResult
+    ) -> list[StrategyCandidate]:
+        """Generate strategies while preserving compatibility with custom generators."""
+        generate = self.strategy_generator.generate
+        try:
+            params = inspect.signature(generate).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        if "available_formats" in params:
+            available_formats = {
+                fmt
+                for engine in self.engines
+                if engine.is_available
+                for fmt in self._formats_for(engine)
+                if fmt
+            }
+            return generate(policy, analysis, available_formats=available_formats)
+        return generate(policy, analysis)
+
     def _evaluate_candidates(
         self,
         image: Image.Image,
@@ -164,13 +235,17 @@ class Optimizer:
         strategies: Iterable[StrategyCandidate],
         policy: Policy,
     ) -> list[tuple[MetricResult, StrategyCandidate, EngineResult]]:
-        """Evaluate all candidates and return valid ones sorted by score."""
+        """Evaluate all candidates and return valid ones."""
         candidates: list[tuple[MetricResult, StrategyCandidate, EngineResult]] = []
+        self._all_rejected_larger = False
+        had_results = False
+        all_larger = True
         for strategy in strategies:
             result, errors = self._try_engines(image, strategy)
-            self._last_engine_errors = errors.copy()
+            self._last_engine_errors.extend(errors)
             if result is None:
                 continue
+            had_results = True
             metrics = self.metric_calculator.compute(
                 original=image,
                 optimized=bytes_to_image(result.data),
@@ -179,17 +254,18 @@ class Optimizer:
             )
             if self._satisfies_policy(metrics, policy, strategy):
                 candidates.append((metrics, strategy, result))
-        candidates.sort(
-            key=lambda item: item[0].perceptual_score,
-            reverse=True,
-        )
+            elif metrics.size_after_kb <= metrics.size_before_kb:
+                # Rejected for reasons other than size increase
+                all_larger = False
+        self._all_rejected_larger = had_results and not candidates and all_larger
         return candidates
 
     def _try_engines(
         self, image: Image.Image, strategy: StrategyCandidate
     ) -> tuple[EngineResult | None, list[str]]:
         """Try all engines for this format, return first success."""
-        engines = self.engine_registry.get(strategy.format.lower(), [])
+        with Optimizer._registry_lock:
+            engines = list(self.engine_registry.get(strategy.format.lower(), []))
         errors: list[str] = []
         for engine in engines:
             if not engine.is_available:
@@ -223,16 +299,17 @@ class Optimizer:
     ) -> tuple[MetricResult, StrategyCandidate, EngineResult]:
         """Select the best candidate from evaluated options."""
         if self.prioritize_quality:
-            return max(candidates, key=lambda item: (item[0].ssim, -item[0].size_after_kb))
-        return min(
-            candidates,
-            key=lambda item: (item[0].size_after_kb, -item[0].ssim, -item[0].perceptual_score),
-        )
+            return max(candidates, key=lambda c: (c[0].ssim, -c[0].size_after_kb))
+        return max(candidates, key=lambda c: (c[0].perceptual_score, -c[0].size_after_kb))
 
     def _satisfies_policy(
         self, metrics: MetricResult, policy: Policy, strategy: StrategyCandidate
     ) -> bool:
         """Check if metrics satisfy policy constraints."""
+        if metrics.size_after_kb <= 0:
+            return False
+        if metrics.perceptual_score < 0.0:
+            return False
         if policy.max_size_kb is not None and metrics.size_after_kb > policy.max_size_kb:
             return False
         if policy.min_ssim is not None and metrics.ssim < policy.min_ssim:

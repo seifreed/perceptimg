@@ -4,11 +4,11 @@ from perceptimg.utils import heuristics, logging_config, validation
 
 
 def test_compute_aspect_ratio_zero_height() -> None:
-    assert heuristics.compute_aspect_ratio(10, 0) == 10000.0
+    assert heuristics.compute_aspect_ratio(10, 0) == 10_000.0
 
 
 def test_compute_aspect_ratio_zero_width() -> None:
-    assert heuristics.compute_aspect_ratio(0, 10) == 0.0001
+    assert heuristics.compute_aspect_ratio(0, 10) == pytest.approx(1.0 / 10_000.0)
 
 
 def test_compute_aspect_ratio_both_zero() -> None:

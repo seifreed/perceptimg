@@ -50,7 +50,7 @@ from .core.batch import (
 )
 from .core.interfaces import ImageAdapter, ImageLoader, ImageWriter
 from .core.optimizer import optimize, optimize_bytes, optimize_image
-from .core.policy import Policy
+from .core.policy import UNSET, Policy
 from .core.strategy import StrategyCandidate
 
 __all__ = [
@@ -58,6 +58,7 @@ __all__ = [
     "optimize_image",
     "optimize_bytes",
     "Policy",
+    "UNSET",
     "optimize_batch",
     "optimize_batch_async",
     "optimize_lazy",

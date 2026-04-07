@@ -6,6 +6,7 @@ for policy- and analysis-driven decisions.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,8 +15,8 @@ from PIL import Image
 
 @dataclass(slots=True)
 class HeuristicConfig:
-    edge_density_text_threshold: float = 0.05
-    edge_density_strong_threshold: float = 0.10
+    edge_density_text_threshold: float = 0.0707
+    edge_density_strong_threshold: float = 0.1414
     color_variance_text_threshold: float = 0.03
     aspect_ratio_text_threshold: float = 2.5
     skin_ratio_threshold: float = 0.12
@@ -27,9 +28,15 @@ class HeuristicConfig:
     skin_tone_b_max: float = 0.55
     skin_tone_rg_min_diff: float = 0.01
     skin_tone_rb_min_diff: float = 0.01
+    elongated_aspect_threshold: float = 2.0
 
 
 DEFAULT_CONFIG = HeuristicConfig()
+
+# Maximum gradient magnitude from central differences on [0, 255] grayscale.
+# np.gradient uses central differences: max per-axis value is 127.5.
+# Diagonal magnitude: sqrt(127.5^2 + 127.5^2) = 127.5 * sqrt(2).
+_MAX_GRADIENT_MAGNITUDE = 127.5 * (2**0.5)  # ~180.312
 
 
 def to_rgb_array(image: Image.Image) -> np.ndarray:
@@ -60,7 +67,7 @@ def compute_edge_density(image: Image.Image, config: HeuristicConfig = DEFAULT_C
     dx = np.gradient(gray, axis=1)
     dy = np.gradient(gray, axis=0)
     magnitude = np.hypot(dx, dy)
-    normalized = magnitude / 255.0
+    normalized = magnitude / _MAX_GRADIENT_MAGNITUDE
     return float(np.mean(normalized))
 
 
@@ -90,8 +97,9 @@ def detect_probable_text(
     low_variance = color_variance < config.color_variance_text_threshold
     threshold = config.aspect_ratio_text_threshold
     extreme_aspect = aspect_ratio > threshold or aspect_ratio < (1 / threshold)
-    elongated = aspect_ratio > 1.6 or aspect_ratio < 0.6
-    return bool((dense_edges and (low_variance or extreme_aspect or elongated)) or strong_edges)
+    threshold_elongated = config.elongated_aspect_threshold
+    elongated = aspect_ratio >= threshold_elongated or aspect_ratio <= (1 / threshold_elongated)
+    return bool(strong_edges or (dense_edges and (low_variance or extreme_aspect or elongated)))
 
 
 def detect_probable_faces(rgb_array: np.ndarray, config: HeuristicConfig = DEFAULT_CONFIG) -> bool:
@@ -152,15 +160,16 @@ def compute_aspect_ratio(width: int, height: int) -> float:
     Returns:
         float: aspect ratio as width/height
             - For normal images: width/height
-            - For height=0, width>0: large positive value (10000.0 as sentinel)
-            - For width=0, height>0: near-zero value (0.0001 as sentinel)
+            - For height=0, width>0: 10_000.0 (capped maximum)
+            - For width=0, height>0: 0.0001 (capped minimum, reciprocal of max)
             - For width=0, height=0: 1.0 (undefined aspect, neutral default)
     """
 
-    if height == 0 and width == 0:
-        return 1.0
-    if height == 0:
-        return 10000.0
-    if width == 0:
-        return 0.0001
+    _MAX_ASPECT = 10_000.0
+    if width <= 0 and height <= 0:
+        return 1.0  # undefined aspect, neutral default
+    if height <= 0:
+        return _MAX_ASPECT
+    if width <= 0:
+        return 1.0 / _MAX_ASPECT
     return float(width / height)

@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
+from PIL import Image
+
 from ...exceptions import ImageLoadError, OptimizationError
-from ...utils.image_io import load_image
+from ...utils.image_io import bytes_to_image, load_image
 from ..checkpoint import CheckpointManager, JobResult, JobStatus
+from ..metrics import MetricCalculator
 from ..metrics_exporter import MetricsCollector
 from ..optimizer import OptimizationResult, Optimizer
 from ..policy import Policy
 from ..rate_limiter import RateLimitConfig, RateLimiter
 from ..retry import RetryConfig, RetryPolicy
+from ..report import OptimizationReport
 from .cache import AnalysisCache
 from .config import (
     BatchConfig,
@@ -43,6 +51,125 @@ __all__ = [
     "optimize_batch_with_metrics",
 ]
 
+_TRANSIENT_ERRORS: tuple[type[Exception], ...] = (ConnectionError, TimeoutError, OSError)
+
+
+def _checkpoint_fallback_image(path: Path) -> Image.Image:
+    try:
+        return load_image(path)
+    except (ImageLoadError, OSError, ValueError):
+        return Image.new("RGB", (1, 1))
+
+
+def _result_from_checkpoint(job: JobResult) -> OptimizationResult | None:
+    if job.status != JobStatus.COMPLETED:
+        return None
+
+    image_bytes = b""
+    artifact_degraded = False
+    if job.artifact_base64:
+        image_bytes = base64.b64decode(job.artifact_base64.encode("ascii"))
+
+    if image_bytes:
+        try:
+            image = bytes_to_image(image_bytes)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Corrupt checkpoint artifact for %s; falling back to reload",
+                job.path,
+            )
+            image = _checkpoint_fallback_image(Path(job.path))
+            image_bytes = b""
+            artifact_degraded = True
+    else:
+        image = _checkpoint_fallback_image(Path(job.path))
+        artifact_degraded = True
+
+    reasons = list(job.reasons) if job.reasons else ["checkpoint_restored"]
+    if artifact_degraded:
+        reasons.append("checkpoint_artifact_corrupt_reloaded_from_disk")
+
+    report = OptimizationReport(
+        chosen_format=job.format or Path(job.path).suffix.lstrip(".") or "unknown",
+        quality=job.quality,
+        size_before_kb=job.size_before_kb if job.size_before_kb is not None else 0.0,
+        size_after_kb=job.size_after_kb if job.size_after_kb is not None else 0.0,
+        ssim=0.0 if artifact_degraded else (job.ssim if job.ssim is not None else 0.0),
+        psnr=0.0 if artifact_degraded else (job.psnr if job.psnr is not None else 0.0),
+        perceptual_score=0.0 if artifact_degraded else (
+            job.perceptual_score
+            if job.perceptual_score is not None
+            else (
+                MetricCalculator()._perceptual_score(job.ssim, job.size_before_kb, job.size_after_kb)
+                if job.ssim is not None and job.size_before_kb is not None and job.size_after_kb is not None
+                else 0.0
+            )
+        ),
+        reasons=reasons,
+    )
+    return OptimizationResult(image_bytes=image_bytes, image=image, report=report)
+
+
+def _batch_result_from_checkpoint(
+    manager: CheckpointManager,
+    requested_paths: Sequence[str | Path] | None = None,
+) -> BatchResult:
+    successful: list[tuple[Path, OptimizationResult]] = []
+    failed: list[tuple[Path, Exception]] = []
+    skipped: list[Path] = []
+    successful_input_indices: list[int] = []
+    failed_input_indices: list[int] = []
+    skipped_input_indices: list[int] = []
+
+    if requested_paths is None:
+        jobs = manager.get_results()
+        grouped_indices: dict[str, list[int]] = {}
+        for index, job in enumerate(jobs):
+            grouped_indices.setdefault(job.path, []).append(index)
+        path_indices: dict[str, Iterator[int]] = {
+            path: iter(indices) for path, indices in grouped_indices.items()
+        }
+    else:
+        jobs = manager.get_results_for(requested_paths)
+        grouped_indices: dict[str, list[int]] = {}
+        for index, path in enumerate(requested_paths):
+            grouped_indices.setdefault(str(Path(path)), []).append(index)
+        path_indices = {path: iter(indices) for path, indices in grouped_indices.items()}
+
+    for job in jobs:
+        path = Path(job.path)
+        input_index = next(path_indices.get(str(path), iter(())), None)
+        if job.status == JobStatus.FAILED:
+            failed.append((path, Exception(job.error or "Unknown error")))
+            if input_index is not None:
+                failed_input_indices.append(input_index)
+            continue
+        if job.status == JobStatus.SKIPPED:
+            skipped.append(path)
+            if input_index is not None:
+                skipped_input_indices.append(input_index)
+            continue
+        restored = _result_from_checkpoint(job)
+        if restored is not None:
+            successful.append((path, restored))
+            if input_index is not None:
+                successful_input_indices.append(input_index)
+        else:
+            failed.append((path, Exception(f"Incomplete job (status: {job.status})")))
+            if input_index is not None:
+                failed_input_indices.append(input_index)
+
+    return BatchResult(
+        successful=successful,
+        failed=failed,
+        skipped=skipped,
+        successful_input_indices=successful_input_indices,
+        failed_input_indices=failed_input_indices,
+        skipped_input_indices=skipped_input_indices,
+    )
+
 
 def optimize_batch(
     image_paths: Sequence[str | Path],
@@ -53,6 +180,7 @@ def optimize_batch(
     continue_on_error: bool = True,
     cache_analysis: bool = True,
     cache_maxsize: int = 128,
+    optimizer: Optimizer | None = None,
 ) -> BatchResult:
     """Optimize multiple images in parallel using thread pool.
 
@@ -83,7 +211,7 @@ def optimize_batch(
         cache_maxsize=cache_maxsize,
     )
     hooks = BatchHooks(on_progress=on_progress)
-    processor = BatchProcessor()
+    processor = BatchProcessor(optimizer=optimizer)
     return processor.execute(image_paths, config, hooks)
 
 
@@ -122,7 +250,7 @@ async def optimize_batch_async(
         ...     print(f"Success: {result.success_rate:.0%}")
         >>> asyncio.run(main())
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
         lambda: optimize_batch(
@@ -175,15 +303,18 @@ def optimize_lazy(
         try:
             if cache:
                 image = load_image(path)
+                original_bytes = path.read_bytes()
                 cached_analysis = cache.get(image, path)
                 if cached_analysis:
                     result = optimizer.optimize_from_analysis(
-                        image, cached_analysis, policy, original_bytes=path.read_bytes()
+                        image, cached_analysis, policy, original_bytes=original_bytes
                     )
                 else:
                     analysis = optimizer.analyzer.analyze(image)
                     cache.set(image, analysis, path)
-                    result = optimizer.optimize(path, policy)
+                    result = optimizer.optimize_from_analysis(
+                        image, analysis, policy, original_bytes=original_bytes
+                    )
             else:
                 result = optimizer.optimize(path, policy)
             yield (path, result)
@@ -209,13 +340,19 @@ def estimate_batch_size(
         Dict with 'estimated_total_kb_before', 'estimated_total_kb_after',
         "estimated_reduction_percent", "sample_size".
     """
+    if sample_size < 1:
+        raise ValueError(f"sample_size must be >= 1, got {sample_size}")
+
     paths = [Path(p) for p in image_paths]
 
     if len(paths) <= sample_size:
         sample = paths
     else:
-        step = max(1, len(paths) // sample_size)
-        sample = paths[::step][:sample_size]
+        if sample_size == 1:
+            sample = [paths[len(paths) // 2]]
+        else:
+            indices = [round(i * (len(paths) - 1) / (sample_size - 1)) for i in range(sample_size)]
+            sample = [paths[i] for i in indices]
 
     optimizer = Optimizer()
     total_before = 0.0
@@ -227,10 +364,31 @@ def estimate_batch_size(
             total_before += result.report.size_before_kb
             total_after += result.report.size_after_kb
         except (OptimizationError, ImageLoadError, OSError):
-            total_before += path.stat().st_size / 1024
+            try:
+                file_size = path.stat().st_size / 1024
+            except OSError:
+                file_size = 0.0
+            total_before += file_size
+            total_after += file_size
 
-    ratio = total_after / total_before if total_before > 0 else 1.0
-    all_sizes = sum(p.stat().st_size / 1024 for p in paths)
+    def _safe_file_size_kb(path: Path) -> float:
+        try:
+            return path.stat().st_size / 1024
+        except OSError:
+            return 0.0
+
+    all_sizes = sum(_safe_file_size_kb(p) for p in paths)
+
+    if total_before <= 0:
+        return {
+            "estimated_total_kb_before": all_sizes,
+            "estimated_total_kb_after": all_sizes,
+            "estimated_reduction_percent": 0.0,
+            "sample_size": len(sample),
+            "all_samples_failed": True,
+        }
+
+    ratio = total_after / total_before
 
     return {
         "estimated_total_kb_before": all_sizes,
@@ -274,23 +432,22 @@ def optimize_batch_with_checkpoint(
         >>> # Resume after crash
         >>> optimize_batch_with_checkpoint(images, policy, "checkpoint.json")
     """
+    if checkpoint_interval < 1:
+        raise ValueError(f"checkpoint_interval must be >= 1, got {checkpoint_interval}")
+
     manager = CheckpointManager(checkpoint_path)
     paths = [Path(p) for p in image_paths]
-    successful: list[tuple[Path, OptimizationResult]] = []
-    failed: list[tuple[Path, Exception]] = []
 
-    if manager.load() and not manager.is_complete():
-        pending = manager.get_pending()
+    if manager.load():
+        new_paths = manager.merge_paths(paths)
+        if new_paths:
+            manager.save()
+        pending = manager.get_pending_for(paths)
+        if not pending:
+            return _batch_result_from_checkpoint(manager, paths)
     else:
         manager.start(paths)
         pending = [str(p) for p in paths]
-
-    if not pending:
-        results = manager.get_results()
-        for r in results:
-            if r.status == JobStatus.FAILED:
-                failed.append((Path(r.path), Exception(r.error or "Unknown error")))
-        return BatchResult(successful=successful, failed=failed)
 
     processor = BatchProcessor()
 
@@ -305,11 +462,17 @@ def optimize_batch_with_checkpoint(
                 size_after_kb=result.report.size_after_kb,
                 ssim=result.report.ssim,
                 format=result.report.chosen_format,
+                quality=result.report.quality,
+                psnr=result.report.psnr,
+                perceptual_score=result.report.perceptual_score,
+                reasons=list(result.report.reasons),
+                artifact_base64=base64.b64encode(result.image_bytes).decode("ascii"),
             ),
+            checkpoint_interval=checkpoint_interval,
         )
 
     def on_image_error_hook(path: Path, exc: Exception) -> None:
-        manager.mark_failed(str(path), str(exc))
+        manager.mark_failed(str(path), str(exc), checkpoint_interval=checkpoint_interval)
 
     def should_checkpoint() -> bool:
         return manager.should_checkpoint(checkpoint_interval)
@@ -337,7 +500,51 @@ def optimize_batch_with_checkpoint(
 
     result = processor.execute(pending, config, hooks)
     manager.save()
-    return result
+    reconstructed = _batch_result_from_checkpoint(manager, paths)
+    # Always return reconstructed: it includes both previous checkpoint
+    # results and current run results (saved via on_image_complete_hook).
+    return reconstructed
+
+
+def _checkpoint_on_success(
+    manager: CheckpointManager | None,
+    path: Path,
+    result: OptimizationResult,
+    checkpoint_interval: int,
+) -> None:
+    """Persist a successful result to checkpoint if manager is active."""
+    if manager is None:
+        return
+    manager.mark_completed(
+        str(path),
+        JobResult(
+            path=str(path),
+            status=JobStatus.COMPLETED,
+            error=None,
+            size_before_kb=result.report.size_before_kb,
+            size_after_kb=result.report.size_after_kb,
+            ssim=result.report.ssim,
+            format=result.report.chosen_format,
+            quality=result.report.quality,
+            psnr=result.report.psnr,
+            perceptual_score=result.report.perceptual_score,
+            reasons=list(result.report.reasons),
+            artifact_base64=base64.b64encode(result.image_bytes).decode("ascii"),
+        ),
+        checkpoint_interval=checkpoint_interval,
+    )
+
+
+def _checkpoint_on_failure(
+    manager: CheckpointManager | None,
+    path: Path,
+    exc: Exception,
+    checkpoint_interval: int,
+) -> None:
+    """Persist a failure to checkpoint if manager is active."""
+    if manager is None:
+        return
+    manager.mark_failed(str(path), str(exc), checkpoint_interval=checkpoint_interval)
 
 
 def optimize_batch_with_retry(
@@ -349,6 +556,10 @@ def optimize_batch_with_retry(
     on_progress: OnProgressCallback | None = None,
     on_retry: Callable[[int, Exception, float], None] | None = None,
     continue_on_error: bool = True,
+    cache_analysis: bool = True,
+    cache_maxsize: int = 128,
+    checkpoint_path: Path | str | None = None,
+    checkpoint_interval: int = 10,
 ) -> BatchResult:
     """Optimize batch with automatic retry on transient errors.
 
@@ -360,6 +571,8 @@ def optimize_batch_with_retry(
         on_progress: Optional callback for progress updates.
         on_retry: Optional callback for retry events: (attempt, error, delay_ms).
         continue_on_error: If True, continue processing on errors.
+        checkpoint_path: Optional path to save checkpoint file for crash recovery.
+        checkpoint_interval: Save checkpoint every N completed images (default: 10).
 
     Returns:
         BatchResult with successful and failed results.
@@ -367,61 +580,183 @@ def optimize_batch_with_retry(
     Example:
         >>> config = RetryConfig(max_retries=3, base_delay_ms=100)
         >>> result = optimize_batch_with_retry(images, policy, retry_config=config)
+        >>> # With checkpoint for crash recovery:
+        >>> result = optimize_batch_with_retry(
+        ...     images, policy, retry_config=config, checkpoint_path="retry_ckpt.json"
+        ... )
     """
     config = BatchConfig(
         policy=policy,
         max_workers=max_workers or min(os.cpu_count() or 4, 8),
         continue_on_error=continue_on_error,
+        cache_analysis=cache_analysis,
+        cache_maxsize=cache_maxsize,
     )
-    retry_policy = RetryPolicy(retry_config or RetryConfig())
+    retry_cfg = retry_config or RetryConfig()
+    if retry_cfg.retry_on is None:
+        retry_cfg = RetryConfig(
+            max_retries=retry_cfg.max_retries,
+            base_delay_ms=retry_cfg.base_delay_ms,
+            max_delay_ms=retry_cfg.max_delay_ms,
+            exponential_base=retry_cfg.exponential_base,
+            jitter_ms=retry_cfg.jitter_ms,
+            retry_on=_TRANSIENT_ERRORS,
+        )
+    retry_policy = RetryPolicy(retry_cfg)
 
     processor = BatchProcessor()
     paths = [Path(p) for p in image_paths]
-    progress = BatchProgress(total=len(paths), completed=0, failed=0)
+    skipped: list[Path] = []
+    skipped_input_indices: list[int] = []
+
+    # Set up checkpoint manager if path provided
+    manager: CheckpointManager | None = None
+    if checkpoint_path is not None:
+        manager = CheckpointManager(checkpoint_path)
+        if manager.load():
+            new_paths = manager.merge_paths(paths)
+            if new_paths:
+                manager.save()
+            pending_strs = manager.get_pending_for(paths)
+            if not pending_strs:
+                return _batch_result_from_checkpoint(manager, paths)
+            pending_set = set(pending_strs)
+            for idx, p in enumerate(paths):
+                if str(p) not in pending_set:
+                    skipped.append(p)
+                    skipped_input_indices.append(idx)
+            paths = [p for p in paths if str(p) in pending_set]
+        else:
+            manager.start(paths)
+
+    original_total = len(paths) + len(skipped)
+    cache = AnalysisCache(maxsize=config.cache_maxsize) if config.cache_analysis else None
+    progress = BatchProgress(total=original_total, completed=len(skipped), failed=0)
     successful: list[tuple[Path, OptimizationResult]] = []
     failed: list[tuple[Path, Exception]] = []
+    successful_input_indices: list[int] = []
+    failed_input_indices: list[int] = []
+    progress_lock = Lock()
+    retry_counts: dict[str, int] = {}
 
-    def process_with_retry(image_path: Path) -> tuple[Path, OptimizationResult | Exception]:
-        def operation() -> OptimizationResult:
-            progress.current_file = str(image_path)
-            result = processor.process_single(image_path, policy)
-            if isinstance(result[1], Exception):
-                raise result[1]
-            return result[1]
-
-        retry_result = retry_policy.execute(operation, on_retry=on_retry)
-
-        if retry_result.success:
-            return (image_path, retry_result.result)
-        return (image_path, retry_result.error or Exception("Unknown error"))
+    def process_single(image_path: Path) -> tuple[Path, OptimizationResult | Exception]:
+        result = processor.process_single(image_path, policy, cache)
+        if isinstance(result[1], Exception):
+            return (image_path, result[1])
+        return (image_path, result[1])
 
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-        futures = {executor.submit(process_with_retry, p): p for p in paths}
+        futures: dict[Future, tuple[int, Path]] = {
+            executor.submit(process_single, p): (index, p) for index, p in enumerate(paths)
+        }
+        pending_timers: list[threading.Timer] = []
+        resubmit_event = threading.Event()
+        abort_requested = False
 
-        for future in as_completed(futures):
-            path = futures[future]
-            try:
-                _, result_or_exc = future.result()
+        while futures:
+            done_futures = set()
+            for future in as_completed(list(futures.keys())):
+                done_futures.add(future)
+                input_index, path = futures.pop(future)
+                snapshot = None
+                try:
+                    _, result_or_exc = future.result()
+                except CancelledError:
+                    continue
+                except Exception as exc:
+                    result_or_exc = exc
+
                 if isinstance(result_or_exc, Exception):
-                    failed.append((path, result_or_exc))
-                    progress.failed += 1
-                    progress.errors.append(f"{path}: {result_or_exc}")
+                    with progress_lock:
+                        path_key = (input_index, str(path))
+                        attempt = retry_counts.get(path_key, 0) + 1
+                        retry_counts[path_key] = attempt
+                        should_retry = (
+                            attempt <= retry_cfg.max_retries
+                            and retry_policy.should_retry(result_or_exc)
+                            and not abort_requested
+                        )
+
+                    if should_retry:
+                        delay_ms = retry_policy.calculate_delay(attempt)
+                        if on_retry:
+                            on_retry(attempt, result_or_exc, delay_ms)
+
+                        def _resubmit(p: Path, idx: int) -> None:
+                            with progress_lock:
+                                if abort_requested:
+                                    return
+                                f = executor.submit(process_single, p)
+                                futures[f] = (idx, p)
+                            resubmit_event.set()
+
+                        timer = threading.Timer(
+                            delay_ms / 1000.0, _resubmit, args=(path, input_index)
+                        )
+                        timer.daemon = True
+                        timer.start()
+                        pending_timers.append(timer)
+                        continue
+
+                    with progress_lock:
+                        progress.current_file = str(path)
+                        failed.append((path, result_or_exc))
+                        failed_input_indices.append(input_index)
+                        progress.failed += 1
+                        progress.errors.append(f"{path}: {result_or_exc}")
+                        _checkpoint_on_failure(manager, path, result_or_exc, checkpoint_interval)
+                        if on_progress:
+                            snapshot = progress.snapshot()
                 else:
-                    successful.append((path, result_or_exc))
-                    progress.completed += 1
-            except Exception as exc:
-                failed.append((path, exc))
-                progress.failed += 1
-                progress.errors.append(f"{path}: {exc}")
+                    with progress_lock:
+                        progress.current_file = str(path)
+                        successful.append((path, result_or_exc))
+                        successful_input_indices.append(input_index)
+                        progress.completed += 1
+                        _checkpoint_on_success(manager, path, result_or_exc, checkpoint_interval)
+                        if on_progress:
+                            snapshot = progress.snapshot()
 
-            if on_progress:
-                on_progress(progress)
+                if snapshot and on_progress:
+                    on_progress(snapshot)
 
-            if not continue_on_error and failed:
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
+                if manager is not None:
+                    manager.save_if_needed(checkpoint_interval)
 
-    return BatchResult(successful=successful, failed=failed)
+                if not continue_on_error and failed and not abort_requested:
+                    abort_requested = True
+                    for t in pending_timers:
+                        t.cancel()
+                    break
+
+            if not futures:
+                # Wait for any pending timers that may add new futures
+                active_timers = [t for t in pending_timers if t.is_alive()]
+                if not active_timers:
+                    break
+                resubmit_event.clear()
+                # Wait until a timer fires _resubmit and signals the event
+                max_wait = max(
+                    (t.interval for t in active_timers if hasattr(t, "interval")),
+                    default=5.0,
+                ) + 1.0
+                resubmit_event.wait(timeout=max_wait)
+                pending_timers = [t for t in pending_timers if t.is_alive()]
+                if not futures:
+                    # Timers finished but no new futures added (cancelled/aborted)
+                    break
+
+    if manager is not None:
+        manager.save()
+
+    return BatchResult(
+        successful=successful,
+        failed=failed,
+        skipped=skipped,
+        successful_input_indices=successful_input_indices,
+        failed_input_indices=failed_input_indices,
+        skipped_input_indices=skipped_input_indices,
+    )
 
 
 def optimize_batch_with_rate_limit(
@@ -502,18 +837,45 @@ def optimize_batch_with_metrics(
 
     paths = [Path(p) for p in image_paths]
     collector.start_job(len(paths))
+    processing_times_ms: dict[str, list[float]] = {}
+    processing_times_lock = Lock()
+
+    class TimedBatchProcessor(BatchProcessor):
+        def process_single(
+            self,
+            image_path: Path,
+            policy: Policy,
+            cache: AnalysisCache | None = None,
+        ) -> tuple[Path, OptimizationResult | Exception]:
+            started_at = time.monotonic()
+            result = super().process_single(image_path, policy, cache)
+            elapsed_ms = (time.monotonic() - started_at) * 1000
+            with processing_times_lock:
+                processing_times_ms.setdefault(str(image_path), []).append(elapsed_ms)
+            return result
 
     def on_image_complete(path: Path, result: OptimizationResult) -> None:
-        collector.record_success(
-            format=result.report.chosen_format,
-            bytes_before=int(result.report.size_before_kb * 1024),
-            bytes_after=int(result.report.size_after_kb * 1024),
-            ssim=result.report.ssim,
-            processing_time_ms=0.0,
-        )
+        with processing_times_lock:
+            timings = processing_times_ms.get(str(path), [])
+            processing_time_ms = timings.pop(0) if timings else 0.0
+            if not timings and str(path) in processing_times_ms:
+                processing_times_ms.pop(str(path), None)
+            collector.record_success(
+                format=result.report.chosen_format,
+                bytes_before=int(result.report.size_before_kb * 1024),
+                bytes_after=int(result.report.size_after_kb * 1024),
+                ssim=result.report.ssim,
+                processing_time_ms=processing_time_ms,
+            )
 
     def on_image_error(path: Path, exc: Exception) -> None:
-        collector.record_failure(type(exc).__name__)
+        with processing_times_lock:
+            timings = processing_times_ms.get(str(path), [])
+            if timings:
+                timings.pop(0)
+            if not timings and str(path) in processing_times_ms:
+                processing_times_ms.pop(str(path), None)
+            collector.record_failure(type(exc).__name__)
 
     hooks = BatchHooks(
         on_image_complete=on_image_complete,
@@ -521,8 +883,9 @@ def optimize_batch_with_metrics(
         on_progress=on_progress,
     )
 
-    processor = BatchProcessor()
+    processor = TimedBatchProcessor()
     result = processor.execute(paths, config, hooks)
+    processing_times_ms.clear()
     collector.end_job()
 
     return result, collector.collect()

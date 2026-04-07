@@ -101,13 +101,16 @@ print(f"Reasons: {result.report.reasons}")
 
 ```bash
 # Basic optimization
-perceptimg optimize input.png --policy policy.json --out output.webp
+perceptimg input.png --policy policy.json --out output.webp
 
 # With inline constraints
-perceptimg optimize input.png --max-size-kb 100 --min-ssim 0.95 --formats webp,avif
+perceptimg input.png --max-size-kb 100 --min-ssim 0.95 --formats webp,avif
 
 # JSON output
-perceptimg optimize input.png --policy policy.json --log-json
+perceptimg input.png --policy policy.json --log-json
+
+# Batch processing with shell-expanded globs
+perceptimg --batch images/*.png --output-dir optimized/
 ```
 
 ### Available Options
@@ -115,7 +118,7 @@ perceptimg optimize input.png --policy policy.json --log-json
 | Option | Description |
 |--------|-------------|
 | `--policy` | Path to JSON policy file |
-| `--out` | Output file path |
+| `--out` | Output file path for single-image mode only |
 | `--max-size-kb` | Maximum output size in KB |
 | `--min-ssim` | Minimum SSIM threshold (0.0-1.0) |
 | `--formats` | Preferred formats (comma-separated) |
@@ -123,6 +126,9 @@ perceptimg optimize input.png --policy policy.json --log-json
 | `--preserve-faces` | Prefer face quality |
 | `--log-json` | Structured JSON logging |
 | `--log-level` | Log level (DEBUG, INFO, WARNING) |
+
+For batch processing, use `--output-dir` instead of `--out`.
+Use either `--input-dir` or positional input paths/globs for batch input, not both.
 
 ---
 

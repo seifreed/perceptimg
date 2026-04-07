@@ -10,8 +10,31 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable, Mapping, MutableMapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal, cast
+
+class _UnsetType:
+    """Sentinel to explicitly unset a field in merge().
+
+    Use ``UNSET`` as a value in a dict passed to ``Policy.merge()`` to
+    clear the corresponding field back to its default (``None``).
+    """
+
+    _instance: _UnsetType | None = None
+
+    def __new__(cls) -> _UnsetType:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _UnsetType()
 
 _ALLOWED_FORMATS = {
     "jpeg",
@@ -38,6 +61,12 @@ def _validate_formats(formats: Sequence[str] | None) -> tuple[str, ...] | None:
     return normalized
 
 
+_POLICY_PUBLIC_FIELDS = frozenset({
+    "max_size_kb", "min_ssim", "preserve_text", "preserve_faces",
+    "allow_lossy", "preferred_formats", "target_use_case",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class Policy:
     """Declarative optimization policy.
@@ -59,6 +88,9 @@ class Policy:
     allow_lossy: bool = True
     preferred_formats: tuple[str, ...] | None = field(default=None, repr=False)
     target_use_case: _TargetUseCase = "web"
+    _explicit_fields: frozenset[str] = field(
+        default=frozenset(), repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.max_size_kb is not None:
@@ -69,8 +101,8 @@ class Policy:
         if self.min_ssim is not None:
             if math.isnan(self.min_ssim) or math.isinf(self.min_ssim):
                 raise ValueError("min_ssim must be a finite number")
-            if not (0 < self.min_ssim <= 1):
-                raise ValueError("min_ssim must be within (0, 1]")
+            if not (0 <= self.min_ssim <= 1):
+                raise ValueError("min_ssim must be within [0, 1]")
         object.__setattr__(self, "preferred_formats", _validate_formats(self.preferred_formats))
 
     def validate_for_size(self, input_size_kb: float) -> list[str]:
@@ -104,6 +136,7 @@ class Policy:
         """Return a serializable dictionary representation."""
 
         data: dict[str, object] = asdict(self)
+        data.pop("_explicit_fields", None)
         if self.preferred_formats is not None:
             data["preferred_formats"] = list(self.preferred_formats)
         return data
@@ -118,6 +151,9 @@ class Policy:
         """Create a policy from a mapping, validating inputs."""
 
         data = dict(payload)
+        data.pop("_explicit_fields", None)
+        explicit = frozenset(k for k in data if k in _POLICY_PUBLIC_FIELDS)
+        data["_explicit_fields"] = explicit
         return cls(**cast(dict[str, Any], data))
 
     @classmethod
@@ -148,40 +184,66 @@ class Policy:
 
         return self.with_updates(**updates)
 
-    def merge(self, other: Policy) -> Policy:
-        """Combine two policies, preferring values from `other` when set.
+    def merge(self, other: Policy | Mapping[str, object]) -> Policy:
+        """Combine two policies, preferring values from ``other`` when set.
 
-        Merge semantics:
+        ``other`` can be a ``Policy`` or a plain mapping.
+
+        Override semantics:
+
         - None values: never override (treated as "unset")
-        - Empty containers (empty tuple, list, dict): never override (treated as "unset")
-        - Boolean fields with False: only override if the base value is also the default
-          (e.g., preserve_text=False in other won't overwrite preserve_text=True in base,
-           but will take effect if base is also the default False)
-        - All other values: override base values
+        - Empty containers (empty tuple, list, dict): never override
 
-        This prevents accidental overwriting of explicitly set True values with defaults.
+        When ``other`` is a ``Policy``, only fields that were explicitly
+        passed at construction time are considered as overrides.  This means
+        ``base.merge(Policy())`` is a no-op, but
+        ``base.merge(Policy(preserve_text=False))`` will set preserve_text
+        to False even if that is the default value.
+        Use a plain mapping for partial updates where unmentioned keys should
+        be preserved.
         """
 
         base = self.to_dict()
-        other_dict = other.to_dict()
 
-        BOOLEAN_DEFAULTS = {
-            "preserve_text": False,
-            "preserve_faces": False,
-            "allow_lossy": True,
-        }
+        if isinstance(other, Policy):
+            other_dict = {
+                k: v
+                for k, v in other.to_dict().items()
+                if k in other._explicit_fields
+            }
+        else:
+            other_dict = dict(other)
+            other_dict.pop("_explicit_fields", None)
 
+        is_policy = isinstance(other, Policy)
         override_data = {}
         for k, v in other_dict.items():
+            if isinstance(v, _UnsetType):
+                override_data[k] = None
+                continue
             if v is None:
                 continue
-            if isinstance(v, (tuple, list, dict)) and len(v) == 0:
-                continue
-            if k in BOOLEAN_DEFAULTS:
-                default_val = BOOLEAN_DEFAULTS[k]
-                if v == default_val and base.get(k) != default_val:
-                    continue
             override_data[k] = v
 
         base.update(override_data)
         return Policy.from_dict(base)
+
+
+# Wrap __init__ to automatically track which fields were explicitly passed.
+_Policy_orig_init = Policy.__init__
+_POLICY_FIELD_NAMES = tuple(
+    f.name for f in fields(Policy) if f.name != "_explicit_fields"
+)
+
+
+def _policy_init_wrapper(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    if not kwargs.get("_explicit_fields"):
+        explicit: set[str] = set()
+        for i in range(min(len(args), len(_POLICY_FIELD_NAMES))):
+            explicit.add(_POLICY_FIELD_NAMES[i])
+        explicit.update(k for k in kwargs if k in _POLICY_PUBLIC_FIELDS)
+        kwargs["_explicit_fields"] = frozenset(explicit)
+    _Policy_orig_init(self, *args, **kwargs)
+
+
+Policy.__init__ = _policy_init_wrapper  # type: ignore[method-assign]

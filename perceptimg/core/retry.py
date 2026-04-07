@@ -25,7 +25,8 @@ class RetryConfig:
     """Configuration for retry behavior.
 
     Attributes:
-        max_retries: Maximum number of retry attempts (default: 3).
+        max_retries: Maximum number of retry attempts after initial failure (default: 3).
+            Total attempts will be max_retries + 1 (initial + retries).
         base_delay_ms: Base delay in milliseconds before first retry (default: 100).
         max_delay_ms: Maximum delay in milliseconds between retries (default: 10000).
         exponential_base: Exponential multiplier for delay (default: 2).
@@ -49,7 +50,7 @@ class RetryResult:
         success: Whether the operation succeeded.
         result: The result if successful.
         error: The final error if failed.
-        attempts: Number of attempts made.
+        attempts: Total number of attempts made (initial + retries).
         total_delay_ms: Total delay from retries in milliseconds.
     """
 
@@ -89,7 +90,7 @@ class RetryPolicy:
         delay = self.config.base_delay_ms * (self.config.exponential_base ** (attempt - 1))
         delay = min(delay, self.config.max_delay_ms)
         jitter = secrets.randbelow(self.config.jitter_ms + 1)
-        return delay + jitter
+        return min(delay + jitter, self.config.max_delay_ms)
 
     def should_retry(self, error: Exception) -> bool:
         """Determine if we should retry based on the error.
@@ -187,12 +188,7 @@ class RetryPolicy:
                 last_error = e
 
                 if attempts <= self.config.max_retries and self.should_retry(e):
-                    delay = self.config.base_delay_ms * (
-                        self.config.exponential_base ** (attempts - 1)
-                    )
-                    delay = min(delay, self.config.max_delay_ms)
-                    jitter = secrets.randbelow(self.config.jitter_ms + 1)
-                    delay_ms = delay + jitter
+                    delay_ms = self.calculate_delay(attempts)
                     total_delay_ms += delay_ms
 
                     if on_retry:

@@ -22,14 +22,29 @@ class BatchProgress:
     total: int
     completed: int
     failed: int
+    skipped: int = 0
     current_file: str | None = None
     errors: list[str] = field(default_factory=list)
+    sequence: int = 0
+
+    def snapshot(self) -> BatchProgress:
+        """Return a copy safe to hand to progress callbacks."""
+        return BatchProgress(
+            total=self.total,
+            completed=self.completed,
+            failed=self.failed,
+            skipped=self.skipped,
+            current_file=self.current_file,
+            errors=list(self.errors),
+            sequence=self.sequence,
+        )
 
     @property
     def success_rate(self) -> float:
-        if self.total == 0:
+        processed = self.completed + self.failed + self.skipped
+        if processed == 0:
             return 0.0
-        return self.completed / self.total
+        return self.completed / processed
 
 
 @dataclass(slots=True)
@@ -38,16 +53,21 @@ class BatchResult:
 
     successful: list[tuple[Path, OptimizationResult]]
     failed: list[tuple[Path, Exception]]
+    skipped: list[Path] = field(default_factory=list)
+    successful_input_indices: list[int] = field(default_factory=list)
+    failed_input_indices: list[int] = field(default_factory=list)
+    skipped_input_indices: list[int] = field(default_factory=list)
 
     @property
     def total(self) -> int:
-        return len(self.successful) + len(self.failed)
+        return len(self.successful) + len(self.failed) + len(self.skipped)
 
     @property
     def success_rate(self) -> float:
-        if self.total == 0:
+        processed = len(self.successful) + len(self.failed) + len(self.skipped)
+        if processed == 0:
             return 0.0
-        return len(self.successful) / self.total
+        return len(self.successful) / processed
 
     def get_reports(self) -> list[OptimizationReport]:
         return [result.report for _, result in self.successful]

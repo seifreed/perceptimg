@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -17,6 +18,10 @@ def test_cli_default_policy_and_output_path(tmp_path: Path, capsys: object) -> N
     finally:
         sys.argv = old
     captured = capsys.readouterr()
-    out_path = image_path.with_stem(f"{image_path.stem}_optimized").with_suffix(".webp")
+    report = json.loads(captured.out)
+    suffix = ".jpg" if report["chosen_format"] == "jpeg" else f'.{report["chosen_format"]}'
+    if report["chosen_format"] == "tiff":
+        suffix = ".tif"
+    out_path = image_path.with_stem(f"{image_path.stem}_optimized").with_suffix(suffix)
     assert out_path.exists()
     assert "chosen_format" in captured.out

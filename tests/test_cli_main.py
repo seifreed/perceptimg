@@ -64,7 +64,11 @@ def test_cli_main_default_policy_and_output(tmp_path: Path, capsys: object) -> N
     finally:
         sys.argv = old_argv
     captured = capsys.readouterr()
+    report = json.loads(captured.out)
     default_out = image_path.with_stem(f"{image_path.stem}_optimized")
-    default_out = default_out.with_suffix(".webp")  # chosen format likely webp
+    suffix = ".jpg" if report["chosen_format"] == "jpeg" else f'.{report["chosen_format"]}'
+    if report["chosen_format"] == "tiff":
+        suffix = ".tif"
+    default_out = default_out.with_suffix(suffix)
     assert default_out.exists()
     assert "chosen_format" in captured.out

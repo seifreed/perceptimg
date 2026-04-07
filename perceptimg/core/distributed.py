@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import importlib
 import json
+import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,7 @@ class Job:
     started_at: str = ""
     completed_at: str = ""
     worker_id: str = ""
+    attempt_id: str = ""
     result: dict[str, Any] | None = None
     error: str | None = None
     retries: int = 0
@@ -62,6 +65,7 @@ class Job:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "worker_id": self.worker_id,
+            "attempt_id": self.attempt_id,
             "result": self.result,
             "error": self.error,
             "retries": self.retries,
@@ -78,6 +82,7 @@ class Job:
             started_at=data.get("started_at", ""),
             completed_at=data.get("completed_at", ""),
             worker_id=data.get("worker_id", ""),
+            attempt_id=data.get("attempt_id", ""),
             result=data.get("result"),
             error=data.get("error"),
             retries=data.get("retries", 0),
@@ -94,7 +99,7 @@ class RedisConfig:
         db: Redis database number (default: 0).
         password: Redis password if required.
         queue_name: Name of the job queue (default: "perceptimg:jobs").
-        result_ttl: Time to keep completed jobs in seconds (default: 3600).
+        result_ttl: Time to keep terminal jobs in seconds (default: 3600).
     """
 
     host: str = "localhost"
@@ -103,6 +108,7 @@ class RedisConfig:
     password: str | None = None
     queue_name: str = "perceptimg:jobs"
     result_ttl: int = 3600
+    max_retries: int = 3
 
 
 class RedisJobQueue:
@@ -118,12 +124,218 @@ class RedisJobQueue:
         >>> # Consumer: process jobs
         >>> for job in queue.consume(worker_id="worker-1"):
         ...     result = process(job.image_path, policy)
-        ...     queue.complete(job.id, result)
+        ...     queue.complete(job.id, "worker-1", result, attempt_id=job.attempt_id)
     """
 
     def __init__(self, config: RedisConfig | None = None):
         self.config = config or RedisConfig()
         self._redis: Any = None
+
+    def _jobs_key(self) -> str:
+        return f"{self.config.queue_name}:jobs"
+
+    def _terminal_job_key(self, job_id: str) -> str:
+        return f"{self.config.queue_name}:terminal:{job_id}"
+
+    def _terminal_keys_pattern(self) -> str:
+        return f"{self.config.queue_name}:terminal:*"
+
+    def _pending_key(self) -> str:
+        return f"{self.config.queue_name}:pending"
+
+    def _processing_key(self) -> str:
+        return f"{self.config.queue_name}:processing"
+
+    def _completed_key(self) -> str:
+        return f"{self.config.queue_name}:completed"
+
+    def _failed_key(self) -> str:
+        return f"{self.config.queue_name}:failed"
+
+    def _apply_result_ttl(self, redis: Any, *keys: str) -> None:
+        if self.config.result_ttl:
+            for key in keys:
+                redis.expire(key, self.config.result_ttl)
+
+    @staticmethod
+    def _decode_job(job_data: str | None) -> Job | None:
+        if not job_data:
+            return None
+        try:
+            return Job.from_dict(json.loads(job_data))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    def _load_live_job(self, redis: Any, job_id: str) -> Job | None:
+        return self._decode_job(redis.hget(self._jobs_key(), job_id))
+
+    def _load_terminal_job(self, redis: Any, job_id: str) -> Job | None:
+        return self._decode_job(redis.hget(self._terminal_job_key(job_id), "data"))
+
+    def _load_job(self, redis: Any, job_id: str) -> Job | None:
+        live_job = self._load_live_job(redis, job_id)
+        if live_job is not None:
+            return live_job
+        return self._load_terminal_job(redis, job_id)
+
+    @staticmethod
+    def _normalize_timeout(timeout: float | int) -> float | int:
+        if timeout < -1:
+            raise ValueError("timeout must be >= -1")
+        return timeout
+
+    def _record_missing_job_metadata(self, redis: Any, job_id: str) -> None:
+        job = Job(
+            id=job_id,
+            image_path="",
+            policy={},
+            status=JobStatus.FAILED,
+            completed_at=datetime.now(UTC).isoformat(),
+            error="Missing job metadata",
+        )
+        self._persist_terminal_job(redis, job)
+
+    def _remove_job_from_lists(self, redis: Any, job_id: str) -> None:
+        redis.lrem(self._pending_key(), 0, job_id)
+        redis.lrem(self._completed_key(), 0, job_id)
+        redis.lrem(self._failed_key(), 0, job_id)
+
+    def _remove_live_membership(self, redis: Any, job_id: str) -> None:
+        redis.lrem(self._pending_key(), 0, job_id)
+        redis.hdel(self._processing_key(), job_id)
+
+    def _normalize_terminal_membership(
+        self,
+        redis: Any,
+        job_id: str,
+        status: JobStatus,
+    ) -> None:
+        self._remove_job_from_lists(redis, job_id)
+        redis.hdel(self._processing_key(), job_id)
+
+        if status == JobStatus.COMPLETED:
+            redis.rpush(self._completed_key(), job_id)
+            self._apply_result_ttl(redis, self._completed_key())
+        elif status == JobStatus.FAILED:
+            redis.rpush(self._failed_key(), job_id)
+
+    def _persist_terminal_job(self, redis: Any, job: Job) -> None:
+        terminal_key = self._terminal_job_key(job.id)
+        self._normalize_terminal_membership(redis, job.id, job.status)
+        pipe = redis.pipeline()
+        pipe.hdel(self._jobs_key(), job.id)
+        pipe.hset(terminal_key, "data", json.dumps(job.to_dict()))
+        pipe.execute()
+        if job.status == JobStatus.COMPLETED:
+            self._apply_result_ttl(redis, terminal_key, self._completed_key())
+        elif job.status == JobStatus.FAILED:
+            self._apply_result_ttl(redis, terminal_key, self._failed_key())
+
+    def _migrate_stale_live_terminal(self, redis: Any, job: Job) -> None:
+        terminal_key = self._terminal_job_key(job.id)
+        self._remove_live_membership(redis, job.id)
+        if self._load_terminal_job(redis, job.id) is None:
+            redis.hset(terminal_key, "data", json.dumps(job.to_dict()))
+            self._apply_result_ttl(redis, terminal_key)
+        redis.hdel(self._jobs_key(), job.id)
+
+    def _iter_terminal_storage_job_ids(self, redis: Any) -> list[str]:
+        keys: list[str] = []
+        scan_iter = getattr(redis, "scan_iter", None)
+        if callable(scan_iter):
+            try:
+                keys.extend(scan_iter(match=self._terminal_keys_pattern()))
+            except TypeError:
+                keys.extend(scan_iter(self._terminal_keys_pattern()))
+        else:
+            keys_fn = getattr(redis, "keys", None)
+            if callable(keys_fn):
+                keys.extend(keys_fn(self._terminal_keys_pattern()))
+
+        prefix = self._terminal_job_key("")
+        job_ids: list[str] = []
+        for key in keys:
+            if isinstance(key, bytes):
+                key = key.decode()
+            if key.startswith(prefix):
+                job_ids.append(key[len(prefix) :])
+        return job_ids
+
+    def _mark_invalid_live_transition(
+        self,
+        redis: Any,
+        job: Job,
+        *,
+        action: str,
+        error: str | None = None,
+    ) -> None:
+        message = f"Invalid state transition: {action} from {job.status.value}"
+        if error:
+            message = f"{message}: {error}"
+
+        job.status = JobStatus.FAILED
+        job.completed_at = datetime.now(UTC).isoformat()
+        job.started_at = ""
+        job.worker_id = ""
+        job.attempt_id = ""
+        job.result = None
+        job.error = message
+
+        self._persist_terminal_job(redis, job)
+
+    def _count_live_terminal_jobs(self, redis: Any, key: str, expected_status: JobStatus) -> int:
+        seen: set[str] = set()
+        # Check list-based IDs first
+        for job_id in redis.lrange(key, 0, -1):
+            if job_id in seen:
+                continue
+            job = self._load_job(redis, job_id)
+            if job is not None and job.status == expected_status:
+                seen.add(job_id)
+        # Only scan terminal storage for IDs not already found
+        for job_id in self._iter_terminal_storage_job_ids(redis):
+            if job_id in seen:
+                continue
+            job = self._load_terminal_job(redis, job_id)
+            if job is not None and job.status == expected_status:
+                seen.add(job_id)
+        return len(seen)
+
+    def _count_live_pending_jobs(self, redis: Any) -> int:
+        job_ids = redis.lrange(self._pending_key(), 0, -1)
+        seen: set[str] = set()
+        for job_id in job_ids:
+            if job_id in seen:
+                continue
+            job_data = redis.hget(self._jobs_key(), job_id)
+            if not job_data:
+                continue
+            try:
+                job = Job.from_dict(json.loads(job_data))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if job.status == JobStatus.QUEUED:
+                seen.add(job_id)
+        return len(seen)
+
+    def _count_live_processing_jobs(self, redis: Any) -> int:
+        seen: set[str] = set()
+        for job_id in redis.hkeys(self._processing_key()):
+            if job_id in seen:
+                continue
+            processing_worker_id = redis.hget(self._processing_key(), job_id)
+            if not processing_worker_id:
+                continue
+            job_data = redis.hget(self._jobs_key(), job_id)
+            if not job_data:
+                continue
+            try:
+                job = Job.from_dict(json.loads(job_data))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            if job.status == JobStatus.PROCESSING and job.worker_id == processing_worker_id:
+                seen.add(job_id)
+        return len(seen)
 
     def _get_redis(self) -> Any:
         """Get Redis connection (lazy import)."""
@@ -159,11 +371,9 @@ class RedisJobQueue:
         Returns:
             List of enqueued job IDs.
         """
-        import uuid
-
         redis = self._get_redis()
         job_ids: list[str] = []
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
 
         for path in image_paths:
             job_id = f"{job_id_prefix or ''}{uuid.uuid4().hex[:12]}"
@@ -174,13 +384,13 @@ class RedisJobQueue:
                 status=JobStatus.QUEUED,
                 created_at=now,
             )
-            redis.hset(f"{self.config.queue_name}:jobs", job_id, json.dumps(job.to_dict()))
-            redis.rpush(f"{self.config.queue_name}:pending", job_id)
+            redis.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
+            redis.rpush(self._pending_key(), job_id)
             job_ids.append(job_id)
 
         return job_ids
 
-    def dequeue(self, worker_id: str, timeout: int = 0) -> Job | None:
+    def dequeue(self, worker_id: str, timeout: float | int = 0) -> Job | None:
         """Dequeue a job for processing.
 
         Args:
@@ -191,79 +401,190 @@ class RedisJobQueue:
             Job if available, None otherwise.
         """
         redis = self._get_redis()
+        timeout = self._normalize_timeout(timeout)
+        deadline = time.monotonic() + float(timeout) if timeout > 0 else None
+        is_first_wait = True
+        max_stale_pops = 10 if timeout == 0 else 100
+        stale_count = 0
+        while True:
+            if timeout == 0:
+                job_id = redis.lpop(self._pending_key())
+                if job_id is None:
+                    return None
+                if stale_count >= max_stale_pops:
+                    redis.lpush(self._pending_key(), job_id)
+                    return None
+                result = (self._pending_key(), job_id)
+            elif timeout == -1:
+                result = redis.blpop(self._pending_key(), timeout=0)
+            else:
+                if deadline is None:
+                    return None
+                if is_first_wait:
+                    remaining = float(timeout)
+                    is_first_wait = False
+                else:
+                    remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                result = redis.blpop(self._pending_key(), timeout=remaining)
 
-        result = redis.blpop(f"{self.config.queue_name}:pending", timeout=timeout)
-        if result is None:
-            return None
+            if result is None:
+                return None
 
-        _, job_id = result
-        job_data = redis.hget(f"{self.config.queue_name}:jobs", job_id)
-        if not job_data:
-            return None
+            _, job_id = result
+            job = self._load_live_job(redis, job_id)
+            if job is None:
+                if self._load_terminal_job(redis, job_id) is not None:
+                    stale_count += 1
+                    continue
+                self._record_missing_job_metadata(redis, job_id)
+                stale_count += 1
+                continue
 
-        job = Job.from_dict(json.loads(job_data))
-        job.status = JobStatus.PROCESSING
-        job.started_at = datetime.utcnow().isoformat()
-        job.worker_id = worker_id
+            if job.status != JobStatus.QUEUED:
+                if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+                    self._migrate_stale_live_terminal(redis, job)
+                    stale_count += 1
+                    continue
+                redis.lrem(self._pending_key(), 0, job_id)
+                stale_count += 1
+                continue
 
-        redis.hset(f"{self.config.queue_name}:jobs", job_id, json.dumps(job.to_dict()))
-        redis.hset(f"{self.config.queue_name}:processing", job_id, worker_id)
+            job.status = JobStatus.PROCESSING
+            job.started_at = datetime.now(UTC).isoformat()
+            job.completed_at = ""
+            job.worker_id = worker_id
+            job.attempt_id = uuid.uuid4().hex[:12]
+            job.result = None
+            job.error = None
 
-        return job
+            try:
+                pipe = redis.pipeline(True)
+                pipe.watch(self._jobs_key())
+                # Re-verify job is still QUEUED after WATCH
+                watched_data = pipe.hget(self._jobs_key(), job_id)
+                if watched_data:
+                    watched_job = self._decode_job(watched_data)
+                    if watched_job is None or watched_job.status != JobStatus.QUEUED:
+                        pipe.reset()
+                        stale_count += 1
+                        continue
+                else:
+                    pipe.reset()
+                    stale_count += 1
+                    continue
+                pipe.multi()
+                pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
+                pipe.hset(self._processing_key(), job_id, worker_id)
+                pipe.execute()
+            except Exception as exc:
+                if "WatchError" in type(exc).__name__:
+                    # Another worker modified the job concurrently — retry
+                    stale_count += 1
+                    continue
+                raise
 
-    def complete(self, job_id: str, result: dict[str, Any]) -> None:
+            return job
+
+    def complete(
+        self,
+        job_id: str,
+        worker_id: str,
+        result: dict[str, Any],
+        *,
+        attempt_id: str,
+    ) -> None:
         """Mark a job as completed.
 
         Args:
             job_id: Job identifier.
+            worker_id: Worker identifier that owns the active attempt.
             result: Job result.
+            attempt_id: Active attempt identifier.
         """
         redis = self._get_redis()
 
-        job_data = redis.hget(f"{self.config.queue_name}:jobs", job_id)
-        if not job_data:
+        job = self._load_job(redis, job_id)
+        if job is None:
             return
 
-        job = Job.from_dict(json.loads(job_data))
+        if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            return
+        if job.worker_id != worker_id:
+            return
+        if job.attempt_id != attempt_id:
+            return
+        if job.status != JobStatus.PROCESSING:
+            self._mark_invalid_live_transition(redis, job, action="complete")
+            return
+
         job.status = JobStatus.COMPLETED
-        job.completed_at = datetime.utcnow().isoformat()
+        job.completed_at = datetime.now(UTC).isoformat()
+        job.worker_id = ""
+        job.attempt_id = ""
+        job.error = None
         job.result = result
 
-        redis.hset(f"{self.config.queue_name}:jobs", job_id, json.dumps(job.to_dict()))
-        redis.hdel(f"{self.config.queue_name}:processing", job_id)
-        redis.rpush(f"{self.config.queue_name}:completed", job_id)
+        self._persist_terminal_job(redis, job)
 
-        if self.config.result_ttl:
-            redis.expire(f"{self.config.queue_name}:jobs", self.config.result_ttl)
-
-    def fail(self, job_id: str, error: str, retry: bool = False) -> None:
+    def fail(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        retry: bool = False,
+        *,
+        attempt_id: str,
+    ) -> None:
         """Mark a job as failed.
 
         Args:
             job_id: Job identifier.
+            worker_id: Worker identifier that owns the active attempt.
             error: Error message.
             retry: Whether to retry the job.
+            attempt_id: Active attempt identifier.
         """
         redis = self._get_redis()
 
-        job_data = redis.hget(f"{self.config.queue_name}:jobs", job_id)
-        if not job_data:
+        job = self._load_job(redis, job_id)
+        if job is None:
             return
 
-        job = Job.from_dict(json.loads(job_data))
+        if job.status in {JobStatus.FAILED, JobStatus.COMPLETED}:
+            return
+        if job.worker_id != worker_id:
+            return
+        if job.attempt_id != attempt_id:
+            return
+        if job.status != JobStatus.PROCESSING:
+            self._mark_invalid_live_transition(redis, job, action="fail", error=error)
+            return
+
         job.retries += 1
         job.error = error
+        self._remove_job_from_lists(redis, job_id)
 
-        if retry and job.retries < 3:
+        if retry and job.retries < self.config.max_retries:
             job.status = JobStatus.QUEUED
-            redis.rpush(f"{self.config.queue_name}:pending", job_id)
+            job.started_at = ""
+            job.completed_at = ""
+            job.worker_id = ""
+            job.attempt_id = ""
+            job.result = None
+            pipe = redis.pipeline()
+            pipe.rpush(self._pending_key(), job_id)
+            pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
+            pipe.hdel(self._processing_key(), job_id)
+            pipe.execute()
         else:
             job.status = JobStatus.FAILED
-            job.completed_at = datetime.utcnow().isoformat()
-            redis.rpush(f"{self.config.queue_name}:failed", job_id)
-
-        redis.hset(f"{self.config.queue_name}:jobs", job_id, json.dumps(job.to_dict()))
-        redis.hdel(f"{self.config.queue_name}:processing", job_id)
+            job.completed_at = datetime.now(UTC).isoformat()
+            job.worker_id = ""
+            job.attempt_id = ""
+            job.result = None
+            self._persist_terminal_job(redis, job)
 
     def get_status(self, job_id: str) -> Job | None:
         """Get job status.
@@ -275,12 +596,7 @@ class RedisJobQueue:
             Job if found, None otherwise.
         """
         redis = self._get_redis()
-
-        job_data = redis.hget(f"{self.config.queue_name}:jobs", job_id)
-        if not job_data:
-            return None
-
-        return Job.from_dict(json.loads(job_data))
+        return self._load_job(redis, job_id)
 
     def get_stats(self) -> dict[str, int]:
         """Get queue statistics.
@@ -291,21 +607,40 @@ class RedisJobQueue:
         redis = self._get_redis()
 
         return {
-            "pending": redis.llen(f"{self.config.queue_name}:pending"),
-            "processing": redis.hlen(f"{self.config.queue_name}:processing"),
-            "completed": redis.llen(f"{self.config.queue_name}:completed"),
-            "failed": redis.llen(f"{self.config.queue_name}:failed"),
+            "pending": self._count_live_pending_jobs(redis),
+            "processing": self._count_live_processing_jobs(redis),
+            "completed": self._count_live_terminal_jobs(
+                redis, self._completed_key(), JobStatus.COMPLETED
+            ),
+            "failed": self._count_live_terminal_jobs(redis, self._failed_key(), JobStatus.FAILED),
         }
 
     def clear(self) -> None:
         """Clear all jobs from the queue."""
         redis = self._get_redis()
+        terminal_ids = set(redis.lrange(self._completed_key(), 0, -1))
+        terminal_ids.update(redis.lrange(self._failed_key(), 0, -1))
+        terminal_keys = {self._terminal_job_key(job_id) for job_id in terminal_ids}
 
-        redis.delete(f"{self.config.queue_name}:jobs")
-        redis.delete(f"{self.config.queue_name}:pending")
-        redis.delete(f"{self.config.queue_name}:processing")
-        redis.delete(f"{self.config.queue_name}:completed")
-        redis.delete(f"{self.config.queue_name}:failed")
+        scan_iter = getattr(redis, "scan_iter", None)
+        if callable(scan_iter):
+            try:
+                terminal_keys.update(scan_iter(match=self._terminal_keys_pattern()))
+            except TypeError:
+                terminal_keys.update(scan_iter(self._terminal_keys_pattern()))
+        else:
+            keys = getattr(redis, "keys", None)
+            if callable(keys):
+                terminal_keys.update(keys(self._terminal_keys_pattern()))
+
+        for key in terminal_keys:
+            redis.delete(key)
+
+        redis.delete(self._jobs_key())
+        redis.delete(self._pending_key())
+        redis.delete(self._processing_key())
+        redis.delete(self._completed_key())
+        redis.delete(self._failed_key())
 
 
 class Worker:
@@ -327,6 +662,11 @@ class Worker:
     ):
         import uuid
 
+        if poll_interval < 0:
+            raise ValueError("poll_interval must be >= 0")
+        if max_jobs is not None and max_jobs < 0:
+            raise ValueError("max_jobs must be >= 0")
+
         self.queue = queue
         self.process_func = process_func
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
@@ -341,20 +681,23 @@ class Worker:
         self._jobs_processed = 0
 
         while self._running:
-            if self.max_jobs and self._jobs_processed >= self.max_jobs:
+            if self.max_jobs is not None and self._jobs_processed >= self.max_jobs:
                 break
 
-            job = self.queue.dequeue(self.worker_id, timeout=int(self.poll_interval))
+            job = self.queue.dequeue(self.worker_id, timeout=self.poll_interval)
 
             if job is None:
                 continue
 
+            self._jobs_processed += 1
+
             try:
                 result = self.process_func(job.image_path, job.policy)
-                self.queue.complete(job.id, result)
-                self._jobs_processed += 1
+                self.queue.complete(job.id, self.worker_id, result, attempt_id=job.attempt_id)
             except Exception as e:
-                self.queue.fail(job.id, str(e), retry=True)
+                _permanent = (FileNotFoundError, PermissionError, ValueError, TypeError)
+                retryable = not isinstance(e, _permanent)
+                self.queue.fail(job.id, self.worker_id, str(e), retry=retryable, attempt_id=job.attempt_id)
 
     def stop(self) -> None:
         """Stop processing jobs."""

@@ -24,6 +24,6 @@ class TooBigEngine(OptimizationEngine):
 def test_optimize_from_analysis_rejects_policy() -> None:
     optimizer = Optimizer(engines=[TooBigEngine()])
     image = Image.new("RGB", (8, 8), "white")
-    policy = Policy(max_size_kb=1, min_ssim=1.0)
+    policy = Policy(max_size_kb=0.0001, min_ssim=1.0, preferred_formats=("jpeg",))
     with pytest.raises(OptimizationError):
         optimizer.optimize_from_analysis(image, optimizer.analyzer.analyze(image), policy)

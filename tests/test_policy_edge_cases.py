@@ -8,32 +8,79 @@ from perceptimg.core.policy import Policy
 
 
 def test_policy_merge_with_empty_preferred_formats() -> None:
-    """Policy.merge should filter empty tuples, preserving base value."""
+    """Policy.merge should respect explicitly passed empty tuple from Policy."""
     base = Policy(max_size_kb=100, preferred_formats=("webp", "jpeg"))
     other = Policy(max_size_kb=50, preferred_formats=())
     merged = base.merge(other)
     assert merged.max_size_kb == 50
-    # Empty tuple () is filtered out in merge, so base's formats are preserved
-    assert merged.preferred_formats == ("webp", "jpeg")
+    # Explicitly passed empty tuple via Policy should override base
+    assert merged.preferred_formats == ()
+
+
+def test_policy_merge_dict_with_empty_tuple_overrides_base() -> None:
+    """Policy.merge with a plain dict should respect explicitly empty containers."""
+    base = Policy(max_size_kb=100, preferred_formats=("webp", "jpeg"))
+    merged = base.merge({"max_size_kb": 50, "preferred_formats": ()})
+    assert merged.max_size_kb == 50
+    # Empty tuple via dict should override base (user explicitly passed empty)
+    assert merged.preferred_formats == ()
 
 
 def test_policy_merge_preserves_base_values() -> None:
-    """Policy.merge should keep base values when other has defaults."""
+    """Policy.merge with a dict should only override keys present in the dict."""
     base = Policy(max_size_kb=100, min_ssim=0.95, preserve_text=True)
-    other = Policy(max_size_kb=50)
-    merged = base.merge(other)
+    merged = base.merge({"max_size_kb": 50})
     assert merged.max_size_kb == 50
     assert merged.min_ssim == 0.95
     assert merged.preserve_text is True
 
 
-def test_policy_merge_defaults_dont_overwrite_explicit_values() -> None:
-    """Policy.merge should not overwrite explicit True values with defaults."""
+def test_policy_merge_empty_dict_keeps_base() -> None:
+    """Policy.merge with an empty dict should not change anything."""
     base = Policy(preserve_text=True, preserve_faces=True)
-    other = Policy()
-    merged = base.merge(other)
+    merged = base.merge({})
     assert merged.preserve_text is True
     assert merged.preserve_faces is True
+
+
+def test_policy_merge_policy_overrides_explicitly_set_fields() -> None:
+    """Policy.merge with a Policy should override when a field was explicitly passed,
+    even if its value matches the default."""
+    base = Policy(preserve_text=True, allow_lossy=False)
+    other = Policy(allow_lossy=True)  # explicitly passed, should override
+    merged = base.merge(other)
+    assert merged.allow_lossy is True
+    # preserve_text was NOT passed to other, so base's True is preserved
+    assert merged.preserve_text is True
+
+
+def test_policy_merge_bare_policy_is_noop() -> None:
+    """Policy.merge with a bare Policy() should not override anything."""
+    base = Policy(preserve_text=True, allow_lossy=False, max_size_kb=200)
+    merged = base.merge(Policy())
+    assert merged.preserve_text is True
+    assert merged.allow_lossy is False
+    assert merged.max_size_kb == 200
+
+
+def test_policy_merge_can_reset_to_default() -> None:
+    """Policy.merge should allow resetting a field to its default value."""
+    base = Policy(preserve_text=True)
+    other = Policy(preserve_text=False)  # explicitly set to default value
+    merged = base.merge(other)
+    assert merged.preserve_text is False
+
+
+def test_policy_merge_policy_only_overrides_explicit_fields() -> None:
+    """Policy.merge with a Policy should only override fields that were explicitly passed."""
+    base = Policy(preserve_text=True, allow_lossy=False, max_size_kb=200)
+    other = Policy(max_size_kb=100)
+    merged = base.merge(other)
+    assert merged.max_size_kb == 100
+    # preserve_text was not passed to other, so base's True is preserved
+    assert merged.preserve_text is True
+    # allow_lossy was not passed to other, so base's False is preserved
+    assert merged.allow_lossy is False
 
 
 def test_policy_merge_complete_override() -> None:
@@ -76,7 +123,7 @@ def test_policy_validation_rejects_invalid_ssim() -> None:
         Policy(min_ssim=1.5)
 
     with pytest.raises(ValueError, match="min_ssim must be within"):
-        Policy(min_ssim=0)
+        Policy(min_ssim=-0.1)
 
 
 def test_policy_validate_for_size_aggressive_compression_warning() -> None:

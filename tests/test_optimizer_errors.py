@@ -31,10 +31,10 @@ def test_optimize_raises_when_no_engines() -> None:
         optimize_image(image, policy, optimizer=optimizer)
 
 
-def test_optimize_from_analysis_raises_when_policy_not_satisfied() -> None:
+def test_optimize_from_analysis_passthrough_when_all_candidates_larger() -> None:
     optimizer = Optimizer(engines=[NoOpEngine()])
     image = Image.new("RGB", (512, 512), "black")
     analysis = optimizer.analyzer.analyze(image)
     policy = Policy(max_size_kb=1, min_ssim=0.99)
-    with pytest.raises(OptimizationError):
-        optimizer.optimize_from_analysis(image, analysis, policy)
+    result = optimizer.optimize_from_analysis(image, analysis, policy)
+    assert "already_optimal" in result.report.reasons
