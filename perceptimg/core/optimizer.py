@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from ..exceptions import OptimizationError
 from ..utils import heuristics
@@ -19,9 +19,6 @@ from .metrics import MetricCalculator, MetricResult
 from .policy import Policy
 from .report import OptimizationReport
 from .strategy import StrategyCandidate, StrategyGenerator
-
-if TYPE_CHECKING:
-    from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -390,13 +387,13 @@ class Optimizer:
         original_bytes = self._image_to_bytes(image)
         return self._evaluate_candidates(image, original_bytes, strategies, policy)
 
-    def _get_pil_image(self, image: ImageLike) -> Image.Image:
+    def _get_pil_image(self, image: ImageLike) -> Any:
         """Extract a PIL image from supported image representations."""
         if hasattr(image, "pil_image"):
             adapter_image = getattr(image, "pil_image", None)
             if adapter_image is not None:
-                return cast(Image.Image, adapter_image)
-        return cast(Image.Image, image)
+                return cast(Any, adapter_image)
+        return cast(Any, image)
 
     def _extract_image_format(self, image: ImageLike) -> str | None:
         """Get image format from PIL image or adapter metadata."""

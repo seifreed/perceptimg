@@ -7,6 +7,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .api import (
     BatchProgress,
@@ -40,7 +41,6 @@ from .api import (
 from .api import (
     _write_batch_report as _api_write_batch_report,
 )
-from .core.optimizer import Optimizer
 from .utils import logging_config
 
 
@@ -58,7 +58,7 @@ def _build_optimizer(
     size_weight: float,
     prioritize_quality: bool,
     max_candidates: int,
-) -> Optimizer:
+) -> Any:
     return _api_build_optimizer(
         ssim_weight=ssim_weight,
         size_weight=size_weight,

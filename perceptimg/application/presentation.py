@@ -11,10 +11,6 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from ..core.batch.config import BatchResult
-from ..core.optimizer import OptimizationResult, Optimizer
-from ..core.policy import Policy
-
 _KNOWN_FORMATS: tuple[str, ...] = (
     "apng",
     "avif",
@@ -42,13 +38,13 @@ class _OptimizerFactory(Protocol):
         size_weight: float,
         prioritize_quality: bool,
         max_candidates: int,
-    ) -> Optimizer: ...
+    ) -> Any: ...
 
 
 class _PolicyFactory(Protocol):
-    def from_json(self, payload: str) -> Policy: ...
+    def from_json(self, payload: str) -> Any: ...
 
-    def from_dict(self, payload: dict[str, object]) -> Policy: ...
+    def from_dict(self, payload: dict[str, object]) -> Any: ...
 
 
 def _policy_factory(policy_factory: _PolicyFactory | None) -> _PolicyFactory:
@@ -92,7 +88,7 @@ def build_optimizer(
     prioritize_quality: bool,
     max_candidates: int,
     optimizer_factory: _OptimizerFactory,
-) -> Optimizer:
+) -> Any:
     """Build a CLI-compatible optimizer with configured strategy priorities."""
     return optimizer_factory(
         ssim_weight=ssim_weight,
@@ -126,7 +122,7 @@ def load_policy(
     policy_path: Path,
     *,
     policy_factory: _PolicyFactory | None = None,
-) -> Policy:
+) -> Any:
     """Load and parse a policy file."""
     factory = _policy_factory(policy_factory)
     payload = policy_path.read_text(encoding="utf-8")
@@ -140,7 +136,7 @@ def policy_from_flags(
     args: object,
     *,
     policy_factory: _PolicyFactory | None = None,
-) -> Policy:
+) -> Any:
     """Build a policy from CLI-like flag arguments."""
     factory = _policy_factory(policy_factory)
     try:
@@ -203,15 +199,15 @@ def reserve_batch_output_path(
 
 def plan_batch_successful_outputs(
     input_paths: Sequence[Path],
-    successful: Sequence[tuple[Path, OptimizationResult]],
+    successful: Sequence[tuple[Path, Any]],
     output_dir: Path,
     output_pattern: str,
     successful_input_indices: Sequence[int] | None = None,
-) -> list[tuple[Path, OptimizationResult, Path]]:
+) -> list[tuple[Path, Any, Path]]:
     """Map successful results to deterministic output paths."""
     reserved_outputs: set[Path] = set()
 
-    def reserve_output(path: Path, result: OptimizationResult) -> Path:
+    def reserve_output(path: Path, result: Any) -> Path:
         ext = resolve_output_extension(result.report.chosen_format)
         output_name = output_pattern.format(
             name=path.stem,
@@ -231,7 +227,7 @@ def plan_batch_successful_outputs(
         successful_input_indices = None
 
     if successful_input_indices is not None and len(successful_input_indices) == len(successful):
-        successful_by_index: dict[int, tuple[Path, OptimizationResult]] = {}
+        successful_by_index: dict[int, tuple[Path, Any]] = {}
         for input_index, (path, result) in zip(
             successful_input_indices,
             successful,
@@ -240,7 +236,7 @@ def plan_batch_successful_outputs(
             if 0 <= input_index < len(input_paths):
                 successful_by_index[input_index] = (path, result)
 
-        planned_by_index: list[tuple[Path, OptimizationResult, Path]] = []
+        planned_by_index: list[tuple[Path, Any, Path]] = []
         for input_index, input_path in enumerate(input_paths):
             pair = successful_by_index.get(input_index)
             if pair is None:
@@ -249,11 +245,11 @@ def plan_batch_successful_outputs(
             planned_by_index.append((path, result, reserve_output(input_path, result)))
         return planned_by_index
 
-    successful_by_path: dict[str, deque[tuple[Path, OptimizationResult]]] = defaultdict(deque)
+    successful_by_path: dict[str, deque[tuple[Path, Any]]] = defaultdict(deque)
     for path, result in successful:
         successful_by_path[str(path)].append((path, result))
 
-    planned_by_path: list[tuple[Path, OptimizationResult, Path]] = []
+    planned_by_path: list[tuple[Path, Any, Path]] = []
     for input_path in input_paths:
         bucket = successful_by_path[str(input_path)]
         if not bucket:
@@ -270,8 +266,8 @@ def plan_batch_successful_outputs(
 
 
 def batch_successful_report_rows(
-    result: BatchResult,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
+    result: Any,
+    successful_outputs: Sequence[tuple[Path, Any, Path]] | None = None,
 ) -> list[dict[str, object]]:
     if successful_outputs is None:
         return [
@@ -302,8 +298,8 @@ def batch_successful_report_rows(
 
 
 def batch_report_data(
-    result: BatchResult,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
+    result: Any,
+    successful_outputs: Sequence[tuple[Path, Any, Path]] | None = None,
 ) -> dict[str, object]:
     return {
         "total": result.total,
@@ -317,7 +313,7 @@ def batch_report_data(
     }
 
 
-def batch_summary_text(result: BatchResult) -> str:
+def batch_summary_text(result: Any) -> str:
     lines = [
         f"Processed {result.total} images:",
         f"Successful: {len(result.successful)}",
@@ -337,9 +333,9 @@ def batch_summary_text(result: BatchResult) -> str:
 
 def write_batch_report(
     report_path: Path,
-    result: BatchResult,
+    result: Any,
     report_format: str,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
+    successful_outputs: Sequence[tuple[Path, Any, Path]] | None = None,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
 

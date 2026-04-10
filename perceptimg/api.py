@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .application import (
     UNSET,
@@ -159,14 +159,14 @@ def _load_policy(
     policy_path: Path,
 ) -> Policy:
     """Facade wrapper for loading policy files."""
-    return _app_load_policy(policy_path)
+    return cast(Policy, _app_load_policy(policy_path))
 
 
 def _policy_from_flags(
     args: object,
 ) -> Policy:
     """Facade wrapper for building policy from CLI flags."""
-    return _app_policy_from_flags(args)
+    return cast(Policy, _app_policy_from_flags(args))
 
 
 def _plan_batch_successful_outputs(
@@ -210,12 +210,15 @@ def _build_optimizer(
     """Build optimizer using the application presentation factory."""
     from ._composition import build_optimizer as default_optimizer_builder
 
-    return _app_build_optimizer(
-        ssim_weight=ssim_weight,
-        size_weight=size_weight,
-        prioritize_quality=prioritize_quality,
-        max_candidates=max_candidates,
-        optimizer_factory=default_optimizer_builder,
+    return cast(
+        Optimizer,
+        _app_build_optimizer(
+            ssim_weight=ssim_weight,
+            size_weight=size_weight,
+            prioritize_quality=prioritize_quality,
+            max_candidates=max_candidates,
+            optimizer_factory=default_optimizer_builder,
+        ),
     )
 
 
@@ -448,6 +451,7 @@ PUBLIC_API: tuple[str, ...] = (
     "ImageWriter",
     "ImageAdapter",
     "OptimizationResult",
+    "Optimizer",
     "Policy",
     "RateLimitConfig",
     "RetryConfig",
@@ -465,6 +469,8 @@ PUBLIC_API: tuple[str, ...] = (
     "optimize_image",
     "optimize_lazy",
 )
+
+_LEGACY_PUBLIC_API: tuple[str, ...] = ()
 
 AnalysisCache = AnalysisCache
 AnalysisResult = AnalysisResult

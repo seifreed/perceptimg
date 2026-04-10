@@ -44,13 +44,13 @@ class AnalysisCache:
         self._order: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
 
-    def _get_pil_image(self, image: ImageLike) -> Image.Image:
+    def _get_pil_image(self, image: ImageLike) -> Any:
         """Extract PIL image from adapter or use directly."""
         if hasattr(image, "pil_image"):
             adapter_image = getattr(image, "pil_image", None)
             if adapter_image is not None:
-                return cast(Image.Image, adapter_image)
-        return cast(Image.Image, image)
+                return cast(Any, adapter_image)
+        return cast(Any, image)
 
     def _compute_efficient_hash(self, pil_image: Image.Image) -> str:
         """Compute hash efficiently for large images using downsampling.
