@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from fnmatch import fnmatch
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from typing import Any
 
 import pytest
@@ -144,12 +144,20 @@ def test_worker_retries_transient_errors() -> None:
 
 def test_worker_rejects_negative_poll_interval() -> None:
     with pytest.raises(ValueError, match="poll_interval must be >= 0"):
-        Worker(_QueueThatStopsAfterOnePoll(), process_func=lambda path, policy: {}, poll_interval=-0.1)
+        Worker(
+            _QueueThatStopsAfterOnePoll(),
+            process_func=lambda path, policy: {},
+            poll_interval=-0.1,
+        )
 
 
 def test_worker_rejects_negative_max_jobs() -> None:
     with pytest.raises(ValueError, match="max_jobs must be >= 0"):
-        Worker(_QueueThatStopsAfterOnePoll(), process_func=lambda path, policy: {}, max_jobs=-1)
+        Worker(
+            _QueueThatStopsAfterOnePoll(),
+            process_func=lambda path, policy: {},
+            max_jobs=-1,
+        )
 
 
 class _DummyPipeline:
@@ -236,7 +244,9 @@ class _DummyRedis:
         return list(values[start : end + 1])
 
     def lrem(self, key: str, count: int, value: str) -> None:
-        values = self.lists.get(key, [])
+        if key not in self.lists:
+            return  # Match real Redis: LREM on non-existent key does nothing
+        values = self.lists[key]
         if count == 0:
             self.lists[key] = [item for item in values if item != value]
             return
@@ -1042,7 +1052,7 @@ def test_complete_late_event_preserves_requeued_retry() -> None:
     assert job["error"] == "boom"
     assert job["result"] is None
     assert redis.lists["perceptimg:test:pending"] == ["job-1"]
-    assert redis.lists.get("perceptimg:test:failed") == []
+    assert "perceptimg:test:failed" not in redis.lists
 
 
 def test_fail_late_event_preserves_requeued_retry() -> None:
@@ -1070,7 +1080,7 @@ def test_fail_late_event_preserves_requeued_retry() -> None:
     assert job["retries"] == 1
     assert job["error"] == "boom"
     assert redis.lists["perceptimg:test:pending"] == ["job-1"]
-    assert redis.lists.get("perceptimg:test:failed") == []
+    assert "perceptimg:test:failed" not in redis.lists
 
 
 def test_complete_old_worker_cannot_close_new_processing_attempt() -> None:
@@ -1101,7 +1111,7 @@ def test_complete_old_worker_cannot_close_new_processing_attempt() -> None:
     assert current["worker_id"] == "worker-new"
     assert current.get("result") is None
     assert redis.hashes["perceptimg:test:processing"] == {"job-1": "worker-new"}
-    assert redis.lists.get("perceptimg:test:completed") == []
+    assert "perceptimg:test:completed" not in redis.lists
 
 
 def test_complete_old_attempt_same_worker_cannot_close_new_processing_attempt() -> None:
@@ -1134,7 +1144,7 @@ def test_complete_old_attempt_same_worker_cannot_close_new_processing_attempt() 
     assert current["attempt_id"] == job.attempt_id
     assert current.get("result") is None
     assert redis.hashes["perceptimg:test:processing"] == {"job-1": "worker-1"}
-    assert redis.lists.get("perceptimg:test:completed") == []
+    assert "perceptimg:test:completed" not in redis.lists
 
 
 def test_complete_requires_attempt_id_for_active_processing_job() -> None:
@@ -1191,7 +1201,7 @@ def test_fail_old_worker_cannot_fail_new_processing_attempt() -> None:
     assert current["worker_id"] == "worker-new"
     assert current.get("error") is None
     assert redis.hashes["perceptimg:test:processing"] == {"job-1": "worker-new"}
-    assert redis.lists.get("perceptimg:test:failed") == []
+    assert "perceptimg:test:failed" not in redis.lists
 
 
 def test_fail_requires_attempt_id_for_active_processing_job() -> None:
@@ -1250,7 +1260,7 @@ def test_fail_old_attempt_same_worker_cannot_fail_new_processing_attempt() -> No
     assert current["attempt_id"] == job.attempt_id
     assert current.get("error") is None
     assert redis.hashes["perceptimg:test:processing"] == {"job-1": "worker-1"}
-    assert redis.lists.get("perceptimg:test:failed") == []
+    assert "perceptimg:test:failed" not in redis.lists
 
 
 def test_complete_clears_stale_error_after_retry() -> None:

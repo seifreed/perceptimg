@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import threading
 import uuid
@@ -46,11 +47,16 @@ class JobResult:
     processing_time_ms: float | None = None
 
 
+def _normalize_checkpoint_path(path: str | Path) -> str:
+    """Normalize checkpoint path keys to a stable representation."""
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
 @dataclass
 class CheckpointData:
     """Serializable checkpoint data."""
 
-    version: int = 2
+    version: int = 3
     job_id: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -60,6 +66,9 @@ class CheckpointData:
     skipped: int = 0
     results: list[dict[str, Any]] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
+    # Metric weights for reproducibility when restoring checkpoints
+    ssim_weight: float = 0.7
+    size_weight: float = 0.3
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +82,8 @@ class CheckpointData:
             "skipped": self.skipped,
             "results": self.results,
             "pending": self.pending,
+            "ssim_weight": self.ssim_weight,
+            "size_weight": self.size_weight,
         }
 
     @classmethod
@@ -88,6 +99,8 @@ class CheckpointData:
             skipped=data.get("skipped", 0),
             results=data.get("results", []),
             pending=data.get("pending", []),
+            ssim_weight=data.get("ssim_weight", 0.7),
+            size_weight=data.get("size_weight", 0.3),
         )
 
 
@@ -130,12 +143,13 @@ class CheckpointManager:
         """
         self._last_checkpoint_count = 0
         self._checkpoint_pending = False
+        normalized_paths = [_normalize_checkpoint_path(path) for path in image_paths]
         self._data = CheckpointData(
             job_id=job_id or uuid.uuid4().hex[:8],
             created_at=datetime.now(UTC).isoformat(),
             updated_at=datetime.now(UTC).isoformat(),
             total=len(image_paths),
-            pending=[str(p) for p in image_paths],
+            pending=normalized_paths,
         )
         self._dirty = True
         if self.checkpoint_path:
@@ -167,7 +181,12 @@ class CheckpointManager:
                 self._checkpoint_pending = False
 
     def _atomic_write(self) -> None:
-        """Write checkpoint atomically to prevent corruption."""
+        """Write checkpoint atomically to prevent corruption.
+
+        On POSIX systems, os.replace() is atomic even when the target exists.
+        On Windows, os.replace() may fail if the target exists with restrictive
+        permissions, so we use a fallback that removes the target first.
+        """
         if not self._data or not self.checkpoint_path:
             return
 
@@ -182,7 +201,17 @@ class CheckpointManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
-            os.replace(temp_path, self.checkpoint_path)
+            # On POSIX, os.replace is atomic even if target exists
+            # On Windows, it may fail if target exists with restrictive permissions
+            try:
+                os.replace(temp_path, self.checkpoint_path)
+            except OSError:
+                # Fallback for Windows: remove target first
+                if sys.platform == "win32":
+                    self.checkpoint_path.unlink(missing_ok=True)
+                    os.replace(temp_path, self.checkpoint_path)
+                else:
+                    raise
         except Exception:
             if Path(temp_path).exists():
                 Path(temp_path).unlink()
@@ -210,7 +239,7 @@ class CheckpointManager:
             if not self._data:
                 return
 
-            path_str = str(path)
+            path_str = _normalize_checkpoint_path(path)
             try:
                 self._data.pending.remove(path_str)
             except ValueError:
@@ -249,9 +278,7 @@ class CheckpointManager:
                 and checkpoint_interval >= 1
                 and self.checkpoint_path
             ):
-                completed_count = (
-                    self._data.completed + self._data.failed + self._data.skipped
-                )
+                completed_count = self._data.completed + self._data.failed + self._data.skipped
                 if (
                     completed_count > 0
                     and completed_count // checkpoint_interval
@@ -296,13 +323,15 @@ class CheckpointManager:
                 return []
 
             # Count how many times each path already appears (completed/pending)
-            known_counts = Counter(result["path"] for result in self._data.results)
-            known_counts.update(self._data.pending)
-            requested_counts = Counter(str(path) for path in image_paths)
+            known_counts = Counter(
+                _normalize_checkpoint_path(result["path"]) for result in self._data.results
+            )
+            known_counts.update(_normalize_checkpoint_path(path) for path in self._data.pending)
+            requested_counts = Counter(_normalize_checkpoint_path(path) for path in image_paths)
 
             new_paths: list[str] = []
             for path in image_paths:
-                path_str = str(path)
+                path_str = _normalize_checkpoint_path(path)
                 if known_counts[path_str] >= requested_counts[path_str]:
                     continue
                 known_counts[path_str] += 1
@@ -319,7 +348,7 @@ class CheckpointManager:
         """Get pending paths assuming lock is already held."""
         if not self._data:
             return []
-        return list(self._data.pending)
+        return [_normalize_checkpoint_path(path) for path in self._data.pending]
 
     def get_pending(self) -> list[str]:
         """Get list of pending image paths.
@@ -333,10 +362,10 @@ class CheckpointManager:
     def get_pending_for(self, image_paths: Sequence[str | Path]) -> list[str]:
         """Get pending image paths limited to the requested input set."""
         with self._lock:
-            requested_remaining = Counter(str(path) for path in image_paths)
+            requested_remaining = Counter(_normalize_checkpoint_path(path) for path in image_paths)
 
             for result in self._data.results if self._data else []:
-                path = result["path"]
+                path = _normalize_checkpoint_path(result["path"])
                 if requested_remaining[path] > 0:
                     requested_remaining[path] -= 1
 
@@ -354,7 +383,7 @@ class CheckpointManager:
             return []
         return [
             JobResult(
-                path=r["path"],
+                path=_normalize_checkpoint_path(r["path"]),
                 status=JobStatus(r["status"]),
                 error=r.get("error"),
                 output_path=r.get("output_path"),
@@ -381,16 +410,41 @@ class CheckpointManager:
         with self._lock:
             return self._get_results_unlocked()
 
+    def get_metric_weights(self) -> tuple[float, float] | None:
+        """Return normalized metric weights persisted in the checkpoint."""
+        with self._lock:
+            if not self._data:
+                return None
+            return self._data.ssim_weight, self._data.size_weight
+
+    def set_metric_weights(self, ssim_weight: float, size_weight: float) -> None:
+        """Persist metric weights for deterministic restart behavior."""
+        if ssim_weight < 0 or size_weight < 0:
+            raise ValueError("Metric weights must be non-negative")
+        if ssim_weight + size_weight <= 0:
+            raise ValueError("Sum of metric weights must be greater than zero")
+
+        total = ssim_weight + size_weight
+        ssim_weight = ssim_weight / total
+        size_weight = size_weight / total
+
+        with self._lock:
+            if not self._data:
+                return
+            self._data.ssim_weight = ssim_weight
+            self._data.size_weight = size_weight
+            self._dirty = True
+
     def get_results_for(self, image_paths: Sequence[str | Path]) -> list[JobResult]:
         """Get processed results limited to the requested input set."""
         with self._lock:
-            requested_remaining = Counter(str(path) for path in image_paths)
+            requested_remaining = Counter(_normalize_checkpoint_path(path) for path in image_paths)
             selected: list[JobResult] = []
             for job in self._get_results_unlocked():
-                if requested_remaining[job.path] <= 0:
+                if requested_remaining[_normalize_checkpoint_path(job.path)] <= 0:
                     continue
                 selected.append(job)
-                requested_remaining[job.path] -= 1
+                requested_remaining[_normalize_checkpoint_path(job.path)] -= 1
             return selected
 
     def get_stats(self) -> dict[str, int]:
@@ -495,7 +549,10 @@ class CheckpointManager:
                 need_save = True
             elif self._data and self.checkpoint_path:
                 completed_count = self._data.completed + self._data.failed + self._data.skipped
-                if completed_count > 0 and completed_count // interval > self._last_checkpoint_count // interval:
+                threshold_crossed = (
+                    completed_count // interval > self._last_checkpoint_count // interval
+                )
+                if completed_count > 0 and threshold_crossed:
                     self._last_checkpoint_count = completed_count
                     need_save = True
             if need_save and self._data and self.checkpoint_path:

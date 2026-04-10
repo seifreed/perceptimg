@@ -11,13 +11,15 @@ import pytest
 from PIL import Image
 
 from perceptimg import Policy
+from perceptimg.application.batch import (
+    estimate_batch_size,
+    optimize_batch,
+    optimize_lazy,
+)
 from perceptimg.core.batch import (
     AnalysisCache,
     BatchProgress,
     BatchResult,
-    estimate_batch_size,
-    optimize_batch,
-    optimize_lazy,
 )
 from perceptimg.core.batch.config import BatchConfig, BatchHooks
 from perceptimg.core.batch.processor import BatchProcessor
@@ -306,7 +308,12 @@ class TestOptimizeBatch:
             time.sleep(0.05)
             return (image_path, ok_result)
 
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             result = optimize_batch(
                 [Path("good1.png"), Path("bad.png"), Path("good2.png")],
                 Policy(max_size_kb=500),
@@ -470,9 +477,7 @@ class TestCheckpointThreadSafety:
         manager.start(paths)
 
         def mark(path: str) -> None:
-            manager.mark_completed(
-                path, JobResult(path=path, status=JobStatus.COMPLETED)
-            )
+            manager.mark_completed(path, JobResult(path=path, status=JobStatus.COMPLETED))
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(mark, p) for p in paths]

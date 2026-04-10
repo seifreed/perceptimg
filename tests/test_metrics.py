@@ -73,7 +73,12 @@ def test_metrics_rgba_original_vs_rgb_optimized_compares_in_rgb() -> None:
     rgba_bytes = image_to_bytes(rgba_image, format="PNG")
     rgb_bytes = image_to_bytes(rgb_image, format="PNG")
     calc = MetricCalculator()
-    metrics = calc.compute(rgba_image, rgb_image, original_bytes=rgba_bytes, optimized_bytes=rgb_bytes)
+    metrics = calc.compute(
+        rgba_image,
+        rgb_image,
+        original_bytes=rgba_bytes,
+        optimized_bytes=rgb_bytes,
+    )
     # RGB content is identical — alpha loss is expected when converting to RGB
     # and should not penalize the candidate
     assert metrics.ssim == pytest.approx(1.0)

@@ -3,91 +3,72 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
-from collections import defaultdict, deque
 from collections.abc import Sequence
-from io import StringIO
 from pathlib import Path
 
-from . import Policy
-from .core.batch import BatchProgress, BatchResult, estimate_batch_size, optimize_batch
-from .core.metrics import MetricCalculator
-from .core.optimizer import OptimizationResult, Optimizer
-from .core.policy import _ALLOWED_FORMATS
-from .core.strategy import StrategyGenerator
+from .api import (
+    BatchProgress,
+    BatchResult,
+    OptimizationResult,
+    Policy,
+    estimate_batch_size,
+    optimize_batch,
+)
+from .api import (
+    _batch_report_data as _api_batch_report_data,
+)
+from .api import (
+    _batch_summary_text as _api_batch_summary_text,
+)
+from .api import (
+    _build_optimizer as _api_build_optimizer,
+)
+from .api import (
+    _load_policy as _api_load_policy,
+)
+from .api import (
+    _plan_batch_successful_outputs as _api_plan_batch_successful_outputs,
+)
+from .api import (
+    _policy_from_flags as _api_policy_from_flags,
+)
+from .api import (
+    _resolve_output_extension as _api_resolve_output_extension,
+)
+from .api import (
+    _write_batch_report as _api_write_batch_report,
+)
+from .core.optimizer import Optimizer
 from .utils import logging_config
-
-FORMAT_EXTENSIONS = {"jpeg": "jpg", "tiff": "tif"}
-
-
-def _get_extension(format_name: str) -> str:
-    return FORMAT_EXTENSIONS.get(format_name, format_name)
 
 
 def _load_policy(policy_path: Path) -> Policy:
-    payload = policy_path.read_text(encoding="utf-8")
-    if policy_path.suffix.lower() in {".json", ".policy"}:
-        return Policy.from_json(payload)
-    data = json.loads(payload)
-    return Policy.from_dict(data)
+    return _api_load_policy(policy_path)
 
 
 def _policy_from_flags(args: argparse.Namespace) -> Policy:
-    if args.policy:
-        return _load_policy(Path(args.policy))
-    base = {
-        "max_size_kb": args.max_size_kb,
-        "min_ssim": args.min_ssim,
-        "preserve_text": args.preserve_text,
-        "preserve_faces": args.preserve_faces,
-        "allow_lossy": (
-            args.allow_lossy if args.allow_lossy is not None else not args.lossless
-        ),
-        "target_use_case": args.target_use_case or "web",
-    }
-    if args.formats:
-        formats = tuple(fmt.strip() for fmt in args.formats.split(",") if fmt.strip())
-        unknown = set(formats) - _ALLOWED_FORMATS
-        if unknown:
-            unknown_list = ", ".join(sorted(unknown))
-            valid_list = ", ".join(sorted(_ALLOWED_FORMATS))
-            raise ValueError(f"Unknown format(s): {unknown_list}. Valid formats: {valid_list}")
-        base["preferred_formats"] = formats
-    return Policy.from_dict(base)
+    return _api_policy_from_flags(args)
 
 
-def _write_output(result: OptimizationResult, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(result.image_bytes)
+def _build_optimizer(
+    *,
+    ssim_weight: float,
+    size_weight: float,
+    prioritize_quality: bool,
+    max_candidates: int,
+) -> Optimizer:
+    return _api_build_optimizer(
+        ssim_weight=ssim_weight,
+        size_weight=size_weight,
+        prioritize_quality=prioritize_quality,
+        max_candidates=max_candidates,
+    )
 
 
-def _with_collision_suffix(path: Path, suffix_index: int) -> Path:
-    filename = path.name
-    if path.suffix:
-        filename = f"{path.stem}_{suffix_index}{path.suffix}"
-    else:
-        filename = f"{filename}_{suffix_index}"
-    return path.with_name(filename)
-
-
-def _reserve_batch_output_path(output_dir: Path, output_name: str, reserved: set[Path]) -> Path:
-    candidate = output_dir / output_name
-    if candidate not in reserved:
-        reserved.add(candidate)
-        return candidate
-
-    suffix_index = 2
-    max_suffix = 10_000
-    while True:
-        if suffix_index > max_suffix:
-            raise RuntimeError(f"Too many filename collisions for {candidate}")
-        deduped = _with_collision_suffix(candidate, suffix_index)
-        if deduped not in reserved:
-            reserved.add(deduped)
-            return deduped
-        suffix_index += 1
+def _resolve_output_extension(format_name: str) -> str:
+    return _api_resolve_output_extension(format_name)
 
 
 def _plan_batch_successful_outputs(
@@ -97,56 +78,43 @@ def _plan_batch_successful_outputs(
     output_pattern: str,
     successful_input_indices: Sequence[int] | None = None,
 ) -> list[tuple[Path, OptimizationResult, Path]]:
-    reserved_outputs: set[Path] = set()
+    return _api_plan_batch_successful_outputs(
+        input_paths,
+        successful,
+        output_dir,
+        output_pattern,
+        successful_input_indices=successful_input_indices,
+    )
 
-    def reserve_output(path: Path, result: OptimizationResult) -> Path:
-        ext = _get_extension(result.report.chosen_format)
-        output_name = output_pattern.format(name=path.stem, ext=ext, format=result.report.chosen_format)
-        return _reserve_batch_output_path(output_dir, output_name, reserved_outputs)
 
-    if successful_input_indices is not None and len(successful_input_indices) != len(successful):
-        import logging
+def _batch_report_data(
+    result: BatchResult,
+    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
+) -> dict[str, object]:
+    return _api_batch_report_data(result, successful_outputs=successful_outputs)
 
-        logging.getLogger(__name__).warning(
-            "Input indices count (%d) != successful count (%d); falling back to path matching",
-            len(successful_input_indices),
-            len(successful),
-        )
-        successful_input_indices = None
 
-    if successful_input_indices is not None and len(successful_input_indices) == len(successful):
-        successful_by_index: dict[int, tuple[Path, OptimizationResult]] = {}
-        for input_index, (path, result) in zip(successful_input_indices, successful, strict=True):
-            if 0 <= input_index < len(input_paths):
-                successful_by_index[input_index] = (path, result)
+def _batch_summary_text(result: BatchResult) -> str:
+    return _api_batch_summary_text(result)
 
-        planned: list[tuple[Path, OptimizationResult, Path]] = []
-        for input_index, input_path in enumerate(input_paths):
-            pair = successful_by_index.get(input_index)
-            if pair is None:
-                continue
-            path, result = pair
-            planned.append((path, result, reserve_output(input_path, result)))
-        return planned
 
-    successful_by_path: defaultdict[str, deque[tuple[Path, OptimizationResult]]] = defaultdict(deque)
-    for path, result in successful:
-        successful_by_path[str(path)].append((path, result))
+def _write_batch_report(
+    report_path: Path,
+    result: BatchResult,
+    report_format: str,
+    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
+) -> None:
+    _api_write_batch_report(
+        report_path,
+        result,
+        report_format,
+        successful_outputs=successful_outputs,
+    )
 
-    planned: list[tuple[Path, OptimizationResult, Path]] = []
-    for input_path in input_paths:
-        bucket = successful_by_path[str(input_path)]
-        if not bucket:
-            continue
-        path, result = bucket.popleft()
-        planned.append((path, result, reserve_output(input_path, result)))
 
-    for bucket in successful_by_path.values():
-        while bucket:
-            path, result = bucket.popleft()
-            planned.append((path, result, reserve_output(path, result)))
-
-    return planned
+def _write_output(result: OptimizationResult, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(result.image_bytes)
 
 
 def _progress_bar(progress: BatchProgress, *, show_errors: bool = True) -> None:
@@ -164,150 +132,6 @@ def _progress_bar(progress: BatchProgress, *, show_errors: bool = True) -> None:
     print(f"\r{' '.join(status_parts)} {current}".ljust(100), end="", file=sys.stderr)
     if completed == progress.total:
         print(file=sys.stderr)
-
-
-def _successful_report_rows(
-    result: BatchResult,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
-) -> list[dict[str, object]]:
-    if successful_outputs is None:
-        return [
-            {
-                "input": str(path),
-                "output_path": None,
-                "output_format": res.report.chosen_format,
-                "size_before_kb": res.report.size_before_kb,
-                "size_after_kb": res.report.size_after_kb,
-                "ssim": res.report.ssim,
-                "psnr": res.report.psnr,
-            }
-            for path, res in result.successful
-        ]
-
-    return [
-        {
-            "input": str(path),
-            "output_path": str(output_path),
-            "output_format": res.report.chosen_format,
-            "size_before_kb": res.report.size_before_kb,
-            "size_after_kb": res.report.size_after_kb,
-            "ssim": res.report.ssim,
-            "psnr": res.report.psnr,
-        }
-        for path, res, output_path in successful_outputs
-    ]
-
-
-def _batch_report_data(
-    result: BatchResult,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
-) -> dict[str, object]:
-    return {
-        "total": result.total,
-        "successful": len(result.successful),
-        "failed": len(result.failed),
-        "skipped": len(result.skipped),
-        "success_rate": result.success_rate,
-        "results": _successful_report_rows(result, successful_outputs),
-        "errors": [{"input": str(path), "error": str(exc)} for path, exc in result.failed],
-        "skipped_items": [{"input": str(path)} for path in result.skipped],
-    }
-
-
-def _batch_summary_text(result: BatchResult) -> str:
-    lines = [
-        f"Processed {result.total} images:",
-        f"Successful: {len(result.successful)}",
-    ]
-    if result.failed:
-        lines.append(f"Failed: {len(result.failed)}")
-    if result.skipped:
-        lines.append(f"Skipped: {len(result.skipped)}")
-    if result.successful:
-        total_before = sum(r.report.size_before_kb for _, r in result.successful)
-        total_after = sum(r.report.size_after_kb for _, r in result.successful)
-        if total_before > 0:
-            reduction = (1 - total_after / total_before) * 100
-            lines.append(f"Total reduction: {reduction:.1f}%")
-    return "\n".join(lines)
-
-
-def _write_batch_report(
-    report_path: Path,
-    result: BatchResult,
-    report_format: str,
-    successful_outputs: Sequence[tuple[Path, OptimizationResult, Path]] | None = None,
-) -> None:
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if report_format == "json":
-        report_path.write_text(
-            json.dumps(_batch_report_data(result, successful_outputs), indent=2),
-            encoding="utf-8",
-        )
-        return
-
-    if report_format == "csv":
-        fieldnames = [
-            "input",
-            "status",
-            "output_path",
-            "output_format",
-            "size_before_kb",
-            "size_after_kb",
-            "ssim",
-            "psnr",
-            "error",
-        ]
-        buffer = StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in _successful_report_rows(result, successful_outputs):
-            writer.writerow(
-                {
-                    "input": row["input"],
-                    "status": "successful",
-                    "output_path": row["output_path"] or "",
-                    "output_format": row["output_format"],
-                    "size_before_kb": row["size_before_kb"],
-                    "size_after_kb": row["size_after_kb"],
-                    "ssim": row["ssim"],
-                    "psnr": row["psnr"],
-                    "error": "",
-                }
-            )
-        for path, exc in result.failed:
-            writer.writerow(
-                {
-                    "input": str(path),
-                    "status": "failed",
-                    "output_path": "",
-                    "output_format": "",
-                    "size_before_kb": "",
-                    "size_after_kb": "",
-                    "ssim": "",
-                    "psnr": "",
-                    "error": str(exc),
-                }
-            )
-        for path in result.skipped:
-            writer.writerow(
-                {
-                    "input": str(path),
-                    "status": "skipped",
-                    "output_path": "",
-                    "output_format": "",
-                    "size_before_kb": "",
-                    "size_after_kb": "",
-                    "ssim": "",
-                    "psnr": "",
-                    "error": "",
-                }
-            )
-        report_path.write_text(buffer.getvalue(), encoding="utf-8")
-        return
-
-    report_path.write_text(_batch_summary_text(result), encoding="utf-8")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -477,32 +301,40 @@ def _collect_batch_inputs(args: argparse.Namespace) -> list[Path]:
         if not input_dir.is_dir():
             print(f"Error: --input-dir must be a directory: {input_dir}", file=sys.stderr)
             sys.exit(1)
-        collected = sorted(
-            (p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in image_extensions),
+        collected_paths = sorted(
+            (
+                p
+                for p in input_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in image_extensions
+            ),
             key=lambda p: p.name,
         )
-        if collected:
-            return collected
+        if collected_paths:
+            return collected_paths
         print(f"Error: No image files found in directory: {input_dir}", file=sys.stderr)
         sys.exit(1)
 
     if input_paths:
-        collected: list[Path] = []
+        collected_items: list[Path] = []
         for path in input_paths:
             if path.is_file():
-                collected.append(path)
+                collected_items.append(path)
             elif path.is_dir():
-                collected.extend(
+                collected_items.extend(
                     sorted(
-                        (p for p in path.iterdir() if p.is_file() and p.suffix.lower() in image_extensions),
+                        (
+                            p
+                            for p in path.iterdir()
+                            if p.is_file() and p.suffix.lower() in image_extensions
+                        ),
                         key=lambda p: p.name,
                     )
                 )
             else:
                 print(f"Error: Batch input not found: {path}", file=sys.stderr)
                 sys.exit(1)
-        if collected:
-            return collected
+        if collected_items:
+            return collected_items
 
     print("Error: No valid input specified", file=sys.stderr)
     sys.exit(1)
@@ -525,14 +357,12 @@ def _process_batch(args: argparse.Namespace, policy: Policy) -> None:
         if args.report_format != "csv":
             _progress_bar(progress)
 
-    optimizer = Optimizer(
-        metric_calculator=MetricCalculator(
-            ssim_weight=args.ssim_weight,
-            size_weight=args.size_weight,
-        ),
+    optimizer = _build_optimizer(
+        ssim_weight=args.ssim_weight,
+        size_weight=args.size_weight,
         prioritize_quality=args.prioritize_quality,
+        max_candidates=args.max_candidates,
     )
-    optimizer.strategy_generator = StrategyGenerator(max_candidates=args.max_candidates)
 
     result = optimize_batch(
         paths,
@@ -580,21 +410,21 @@ def _process_single(args: argparse.Namespace, policy: Policy) -> None:
         print(f"Error: Input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    optimizer = Optimizer(
-        metric_calculator=MetricCalculator(
-            ssim_weight=args.ssim_weight,
-            size_weight=args.size_weight,
-        ),
+    optimizer = _build_optimizer(
+        ssim_weight=args.ssim_weight,
+        size_weight=args.size_weight,
         prioritize_quality=args.prioritize_quality,
+        max_candidates=args.max_candidates,
     )
-    optimizer.strategy_generator = StrategyGenerator(max_candidates=args.max_candidates)
     result = optimizer.optimize(input_path, policy)
 
     if args.out:
         output_path = Path(args.out)
     else:
         output_path = input_path.with_stem(f"{input_path.stem}_optimized")
-        output_path = output_path.with_suffix(f".{_get_extension(result.report.chosen_format)}")
+        output_path = output_path.with_suffix(
+            f".{_resolve_output_extension(result.report.chosen_format)}"
+        )
 
     _write_output(result, output_path)
     print(json.dumps(result.report.to_dict(), indent=2))

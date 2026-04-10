@@ -9,10 +9,17 @@ Dependency Rule:
     adapters → implements interfaces (depends on frameworks like PIL)
 """
 
-from .pil_adapter import PILImageAdapter, bytes_to_image, image_to_bytes, load_image
+from .pil_adapter import (
+    PILImageAdapter,
+    PILImageIO,
+    bytes_to_image,
+    image_to_bytes,
+    load_image,
+)
 
 __all__ = [
     "PILImageAdapter",
+    "PILImageIO",
     "load_image",
     "bytes_to_image",
     "image_to_bytes",

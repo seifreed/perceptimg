@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from skimage.metrics import structural_similarity
@@ -17,11 +17,7 @@ from skimage.metrics import structural_similarity
 if TYPE_CHECKING:
     from PIL import Image
 
-    from ..adapters.pil_adapter import PILImageAdapter
-
-from ..utils.image_io import size_kb
-
-ImageLike = Union["Image.Image", "PILImageAdapter"]
+ImageLike = Any
 
 PSNR_MAX_VALUE = 100.0
 SSIM_MAX_DIMENSION = 2048
@@ -118,8 +114,8 @@ class MetricCalculator:
 
         ssim_value = self._ssim(original_pil, optimized_pil)
         psnr_value = self._psnr(original_pil, optimized_pil)
-        before = size_kb(original_bytes)
-        after = size_kb(optimized_bytes)
+        before = len(original_bytes) / 1024.0
+        after = len(optimized_bytes) / 1024.0
         score = self._perceptual_score(ssim_value, before, after)
 
         return MetricResult(
@@ -132,11 +128,11 @@ class MetricCalculator:
 
     def _get_pil_image(self, image: ImageLike) -> Image.Image:
         """Extract PIL image from adapter or use directly."""
-        from perceptimg.adapters.pil_adapter import PILImageAdapter
-
-        if isinstance(image, PILImageAdapter):
-            return image.pil_image
-        return image
+        if hasattr(image, "pil_image"):
+            adapter_image = getattr(image, "pil_image", None)
+            if adapter_image is not None:
+                return cast(Image.Image, adapter_image)
+        return cast(Image.Image, image)
 
     def _should_downsample(self, width: int, height: int) -> bool:
         if self._config.downsample_method == "none":
@@ -164,11 +160,11 @@ class MetricCalculator:
 
         skimage defaults to a 7x7 window, which fails for images smaller than 7px.
         We pick the largest odd window up to 7 that fits the image. For images
-        smaller than 3px in either dimension, SSIM's sliding-window formulation is
+        smaller than 7px in either dimension, SSIM's sliding-window formulation is
         not defined reliably and we fall back to a stable similarity proxy.
         """
         min_dim = min(width, height)
-        if min_dim < 3:
+        if min_dim < 7:
             return None
         win_size = min(min_dim, 7)
         if win_size % 2 == 0:
@@ -191,13 +187,41 @@ class MetricCalculator:
         """Determine comparison mode considering both images.
 
         If both images have an alpha channel, compare in RGBA to account for
-        transparency differences.  When only one image has alpha (e.g. RGBA
+        transparency differences. When only one image has alpha (e.g. RGBA
         original optimized to JPEG/RGB), compare in RGB so the identical
         synthetic alpha channel does not dilute real RGB differences.
+
+        For grayscale images, maintain L mode to avoid unnecessary conversion.
+
+        Palette images (P mode) with transparency are treated as having alpha.
         """
         alpha_modes = {"RGBA", "LA", "PA"}
-        if original.mode in alpha_modes and optimized.mode in alpha_modes:
+        gray_modes = {"L", "I", "F"}
+
+        # Detect if images have alpha channels
+        orig_has_alpha = original.mode in alpha_modes
+        opt_has_alpha = optimized.mode in alpha_modes
+
+        # Check for transparency in palette mode
+        if original.mode == "P":
+            trans = original.info.get("transparency")
+            if trans is not None:
+                orig_has_alpha = True
+        if optimized.mode == "P":
+            trans = optimized.info.get("transparency")
+            if trans is not None:
+                opt_has_alpha = True
+
+        # If both have alpha, compare in RGBA
+        if orig_has_alpha and opt_has_alpha:
             return "RGBA"
+
+        # If both are grayscale (without alpha, since alpha case handled above)
+        orig_is_gray = original.mode in gray_modes
+        opt_is_gray = optimized.mode in gray_modes
+        if orig_is_gray and opt_is_gray:
+            return "L"
+
         return "RGB"
 
     def _ssim(self, original: Image.Image, optimized: Image.Image) -> float:
@@ -225,7 +249,8 @@ class MetricCalculator:
             channel_axis=2 if target_mode in ("RGB", "RGBA") else None,
             win_size=win_size,
         )
-        return float(ssim_result) if not isinstance(ssim_result, (tuple, list)) else float(ssim_result[0])
+        # With channel_axis parameter, skimage always returns a float, not a tuple
+        return float(ssim_result)
 
     def _psnr(self, original: Image.Image, optimized: Image.Image) -> float:
         target_mode = self._resolve_target_mode(original, optimized)
@@ -251,6 +276,9 @@ class MetricCalculator:
             return -float("inf")
         if not math.isfinite(after_kb) or after_kb <= 0:
             return -float("inf")  # Invalid 0-byte output should never win
+        if not math.isfinite(ssim_value):
+            # NaN or infinite SSIM indicates numerical issues; reject candidate
+            return -float("inf")
         ssim_clamped = max(0.0, min(1.0, ssim_value))
         compression_ratio = (before_kb - after_kb) / before_kb
         size_score = max(-1.0, min(1.0, compression_ratio))

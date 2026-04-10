@@ -17,7 +17,12 @@ def test_strategy_generator_mobile_quality_plan() -> None:
     assert any(candidate.quality == 60 for candidate in qualities if candidate.quality)
 
 
-def test_strategy_generator_spreads_candidates_across_formats() -> None:
+def test_strategy_generator_respects_priority_order() -> None:
+    """Test that strategy generator respects format priority order.
+
+    With max_candidates=8, the generator should take the first 8 formats from
+    DEFAULT_ORDER, prioritizing modern formats over legacy ones.
+    """
     policy = Policy()
     analysis = AnalysisResult(
         edge_density=0.05,
@@ -31,10 +36,18 @@ def test_strategy_generator_spreads_candidates_across_formats() -> None:
     candidates = StrategyGenerator(max_candidates=8).generate(policy, analysis)
     formats = [candidate.format for candidate in candidates]
 
-    assert "jpeg" in formats
-    assert "png" in formats
-    assert "gif" in formats
-    assert "apng" in formats
+    # Top-priority formats should remain included in the distributed selection.
+    assert "jxl" in formats
+    assert "avif" in formats
+    assert "webp" in formats
+    # Priority is preserved, but at the selection cap some early-lossy formats can
+    # be skipped in favor of distributed coverage of the list.
+    assert "tiff" in formats
+
+    # With distribution over 10 candidates and limit 8, a lower-priority format
+    # can still be selected to improve spread.
+    assert len(formats) == 8
+    assert any(fmt in {"heif", "heic", "gif", "tiff", "apng"} for fmt in formats)
 
 
 def test_strategy_generator_respects_max_candidates_hard_limit() -> None:

@@ -5,14 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from ..report import OptimizationReport
 
 from ..optimizer import OptimizationResult
 from ..policy import Policy
-from ..rate_limiter import RateLimiter
+
+
+class RateLimiterLike(Protocol):
+    """Minimal rate limiter contract used by batch hooks."""
+
+    def acquire(self, timeout_ms: int | None = None) -> bool: ...
 
 
 @dataclass(slots=True)
@@ -107,4 +112,4 @@ class BatchHooks:
     on_progress: OnProgressCallback | None = None
     should_checkpoint: Callable[[], bool] | None = None
     on_checkpoint: Callable[[], None] | None = None
-    rate_limiter: RateLimiter | None = None
+    rate_limiter: RateLimiterLike | None = None

@@ -44,6 +44,6 @@ class HeifEngine(OptimizationEngine):
         return EngineResult(
             data=data,
             format=fmt,
-            quality=actual_quality if actual_quality is not None else strategy.quality,
+            quality=None if strategy.lossless else actual_quality,
             metadata=save_kwargs,
         )

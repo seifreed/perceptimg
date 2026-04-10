@@ -7,16 +7,14 @@ with both PIL.Image and ImageAdapter implementations.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, cast
 
 from ..utils import heuristics
 
 if TYPE_CHECKING:
     from PIL import Image
 
-    from ..adapters.pil_adapter import PILImageAdapter
-
-ImageLike = Union["Image.Image", "PILImageAdapter"]
+ImageLike = Any
 
 
 class AnalysisResult:
@@ -106,8 +104,8 @@ class Analyzer:
 
     def _get_pil_image(self, image: ImageLike) -> Image.Image:
         """Extract PIL image from adapter or use directly."""
-        from perceptimg.adapters.pil_adapter import PILImageAdapter
-
-        if isinstance(image, PILImageAdapter):
-            return image.pil_image
-        return image
+        if hasattr(image, "pil_image"):
+            adapter_image = getattr(image, "pil_image", None)
+            if adapter_image is not None:
+                return cast(Image.Image, adapter_image)
+        return cast(Image.Image, image)

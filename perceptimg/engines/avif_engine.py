@@ -42,6 +42,6 @@ class AvifEngine(OptimizationEngine):
         return EngineResult(
             data=data,
             format="avif",
-            quality=actual_quality if actual_quality is not None else strategy.quality,
+            quality=None if strategy.lossless else actual_quality,
             metadata=save_kwargs,
         )

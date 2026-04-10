@@ -26,3 +26,16 @@ def test_strategy_generator_raises_when_no_formats() -> None:
             generator.generate(policy, analysis)
     finally:
         strategy_module.DEFAULT_ORDER = original_order
+
+
+def test_distributed_indices_spreads_selection() -> None:
+    indices = StrategyGenerator._distributed_indices(10, 8)
+    assert indices == sorted(indices)
+    assert indices[0] == 0
+    assert indices[-1] == 9
+    assert len(indices) == 8
+    assert len(set(indices)) == len(indices)
+    assert any(
+        next_index - prev_index > 1
+        for prev_index, next_index in zip(indices, indices[1:], strict=True)
+    )

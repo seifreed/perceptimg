@@ -42,8 +42,11 @@ def load_image(path: str | Path) -> Image.Image:
         ImageLoadError: If the image cannot be loaded.
         InvalidImageError: If the image has invalid dimensions (0x0).
     """
+    image = Path(path)
     try:
-        loaded_image: Image.Image = Image.open(Path(path))
+        with Image.open(image) as raw_image:
+            raw_image.load()
+            loaded_image: Image.Image = raw_image.copy()
     except FileNotFoundError as exc:
         raise ImageLoadError(f"Image file not found: {path}") from exc
     except PermissionError as exc:
@@ -102,7 +105,9 @@ def bytes_to_image(data: bytes) -> Image.Image:
         InvalidImageError: If the image has invalid dimensions (0x0).
     """
     try:
-        loaded_image: Image.Image = Image.open(BytesIO(data))
+        with Image.open(BytesIO(data)) as raw_image:
+            raw_image.load()
+            loaded_image: Image.Image = raw_image.copy()
     except Exception as exc:
         if "UnidentifiedImageError" in type(exc).__name__:
             raise ImageLoadError(f"Cannot identify image from bytes: {exc}") from exc

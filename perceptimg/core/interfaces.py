@@ -10,7 +10,7 @@ Dependency Rule:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -85,15 +85,16 @@ class ImageLoader(Protocol):
         """
         ...
 
+
+class ImageIO(Protocol):
+    """Protocol for image I/O operations."""
+
+    def load_from_path(self, path: str | Path) -> ImageAdapter:
+        """Load an image from a file path."""
+        ...
+
     def load_from_bytes(self, data: bytes) -> ImageAdapter:
-        """Load an image from raw bytes.
-
-        Args:
-            data: Raw image bytes.
-
-        Returns:
-            Loaded image adapter.
-        """
+        """Load an image from raw bytes."""
         ...
 
 
@@ -124,3 +125,31 @@ class ArrayAdapter(Protocol):
             Numpy array representation.
         """
         ...
+
+
+@runtime_checkable
+class EngineResult(Protocol):
+    """Protocol for engine optimization results."""
+
+    data: bytes
+    format: str
+    quality: int | None
+
+
+@runtime_checkable
+class OptimizationEngine(Protocol):
+    """Protocol for image optimization engines.
+
+    Core uses this protocol to remain independent of concrete engine
+    implementations in the adapters/infrastructure layer.
+    """
+
+    format: str
+    priority: int = 0
+
+    @property
+    def is_available(self) -> bool: ...
+
+    def can_handle(self, fmt: str) -> bool: ...
+
+    def optimize(self, image: Any, strategy: Any) -> EngineResult: ...

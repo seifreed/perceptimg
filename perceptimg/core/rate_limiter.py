@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from math import isfinite
 import time
 from dataclasses import dataclass
+from math import isfinite
 from threading import Condition, Lock
 
 _TOKEN_EPSILON = 1e-6
@@ -27,6 +27,11 @@ class RateLimitConfig:
     def __post_init__(self) -> None:
         if not isfinite(self.requests_per_second) or self.requests_per_second <= 0:
             raise ValueError("requests_per_second must be a finite number > 0")
+        if self.requests_per_second > 10000:
+            raise ValueError(
+                "requests_per_second must be <= 10000 "
+                "(use a lower value or remove rate limiting)"
+            )
         if self.burst_size < 1:
             raise ValueError("burst_size must be >= 1")
         if self.wait_timeout_ms < 0:

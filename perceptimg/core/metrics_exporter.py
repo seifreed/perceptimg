@@ -231,11 +231,16 @@ class PrometheusMetricsExporter:
             lines.append(f"# TYPE {ns}_batch_compression_ratio gauge")
             lines.append(f"{ns}_batch_compression_ratio {m.average_compression_ratio:.4f}")
 
-            lines.append(f"# HELP {ns}_batch_processing_time_ms Total processing time in milliseconds")
+            lines.append(
+                f"# HELP {ns}_batch_processing_time_ms " "Total processing time in milliseconds"
+            )
             lines.append(f"# TYPE {ns}_batch_processing_time_ms counter")
             lines.append(f"{ns}_batch_processing_time_ms {m.total_processing_time_ms:.0f}")
 
-            lines.append(f"# HELP {ns}_batch_job_duration_ms Total job wall-clock duration in milliseconds")
+            lines.append(
+                f"# HELP {ns}_batch_job_duration_ms "
+                "Total job wall-clock duration in milliseconds"
+            )
             lines.append(f"# TYPE {ns}_batch_job_duration_ms counter")
             lines.append(f"{ns}_batch_job_duration_ms {m.job_duration_ms:.0f}")
 

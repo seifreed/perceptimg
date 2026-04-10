@@ -2,6 +2,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import perceptimg.core.optimizer as optimizer_module
 from perceptimg import Policy, optimize
 from perceptimg.core.optimizer import Optimizer
 from perceptimg.core.strategy import StrategyCandidate
@@ -55,7 +56,7 @@ def test_thread_local_isolation_between_instances():
     opt1 = Optimizer()
     opt2 = Optimizer()
 
-    opt1._last_engine_errors = ["error from opt1"]
+    opt1._last_engine_errors.extend(["error from opt1"])
     assert opt2._last_engine_errors == []
     assert opt1._last_engine_errors == ["error from opt1"]
 
@@ -139,3 +140,25 @@ def test_optimize_handles_small_images(tmp_path: Path) -> None:
 
     assert result.image_bytes
     assert result.report.chosen_format
+
+
+def test_optimizer_default_engine_provider_is_used_only_for_none_engines() -> None:
+    def provider() -> tuple[OptimizationEngine]:
+        return ()
+
+    previous_provider = optimizer_module._default_engine_provider
+    called = {"count": 0}
+
+    def tracking_provider() -> tuple[OptimizationEngine]:
+        called["count"] += 1
+        return provider()
+
+    optimizer_module.set_default_engine_provider(tracking_provider)
+    try:
+        Optimizer()
+        assert called["count"] == 1
+
+        Optimizer([])
+        assert called["count"] == 1
+    finally:
+        optimizer_module.set_default_engine_provider(previous_provider)

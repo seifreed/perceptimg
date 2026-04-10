@@ -6,7 +6,6 @@ for policy- and analysis-driven decisions.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -95,11 +94,11 @@ def detect_probable_text(
     dense_edges = edge_density > config.edge_density_text_threshold
     strong_edges = edge_density > config.edge_density_strong_threshold
     low_variance = color_variance < config.color_variance_text_threshold
-    threshold = config.aspect_ratio_text_threshold
-    extreme_aspect = aspect_ratio > threshold or aspect_ratio < (1 / threshold)
+    # Note: extreme_aspect (threshold 2.5) is a subset of elongated (threshold 2.0)
+    # We only need to check elongated since it's the broader condition
     threshold_elongated = config.elongated_aspect_threshold
     elongated = aspect_ratio >= threshold_elongated or aspect_ratio <= (1 / threshold_elongated)
-    return bool(strong_edges or (dense_edges and (low_variance or extreme_aspect or elongated)))
+    return bool(strong_edges or (dense_edges and (low_variance or elongated)))
 
 
 def detect_probable_faces(rgb_array: np.ndarray, config: HeuristicConfig = DEFAULT_CONFIG) -> bool:

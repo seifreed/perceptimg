@@ -184,7 +184,9 @@ def test_collect_batch_inputs_rejects_input_dir_with_only_image_named_directorie
     assert "No image files found in directory:" in captured.err
 
 
-def test_cli_main_auto_batches_multiple_inputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_main_auto_batches_multiple_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     from PIL import Image
 
     image_one = tmp_path / "img1.png"
@@ -294,8 +296,9 @@ def test_cli_batch_same_basename_uses_input_order_for_output_paths(
 ) -> None:
     from types import SimpleNamespace
 
-    import perceptimg.cli as cli_module
     from PIL import Image
+
+    import perceptimg.cli as cli_module
     from perceptimg.core.batch.config import BatchResult
 
     class _DummyOptimizationResult:
@@ -379,8 +382,9 @@ def test_cli_batch_exact_duplicate_paths_use_input_occurrence_order(
 ) -> None:
     from types import SimpleNamespace
 
-    import perceptimg.cli as cli_module
     from PIL import Image
+
+    import perceptimg.cli as cli_module
     from perceptimg.core.batch.config import BatchResult
 
     class _DummyOptimizationResult:
@@ -560,9 +564,7 @@ def test_cli_batch_report_format_summary_writes_summary_text(
 
 
 def test_cli_batch_report_data_includes_skipped_items() -> None:
-    report = _batch_report_data(
-        BatchResult(successful=[], failed=[], skipped=[Path("a.png")])
-    )
+    report = _batch_report_data(BatchResult(successful=[], failed=[], skipped=[Path("a.png")]))
 
     assert report["total"] == 1
     assert report["successful"] == 0
@@ -586,9 +588,7 @@ def test_cli_batch_report_format_csv_includes_skipped_rows(tmp_path: Path) -> No
 
 
 def test_cli_batch_summary_text_includes_skipped() -> None:
-    summary = _batch_summary_text(
-        BatchResult(successful=[], failed=[], skipped=[Path("a.png")])
-    )
+    summary = _batch_summary_text(BatchResult(successful=[], failed=[], skipped=[Path("a.png")]))
 
     assert "Processed 1 images:" in summary
     assert "Successful: 0" in summary
@@ -599,6 +599,7 @@ def test_cli_batch_summary_console_matches_report_when_skipped_present(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from PIL import Image
+
     import perceptimg.cli as cli_module
 
     image_path = tmp_path / "img1.png"
@@ -637,6 +638,7 @@ def test_cli_batch_report_failure_preserves_written_outputs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from PIL import Image
+
     import perceptimg.cli as cli_module
 
     image_path = tmp_path / "img1.png"
@@ -676,6 +678,7 @@ def test_cli_batch_output_write_failure_exits_cleanly(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from PIL import Image
+
     import perceptimg.cli as cli_module
 
     image_one = tmp_path / "img1.png"
@@ -787,7 +790,9 @@ def test_cli_rejects_input_dir_with_positional_inputs(
     assert not report_path.exists()
 
 
-def test_cli_main_rejects_empty_input_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_main_rejects_empty_input_dir(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     input_dir = tmp_path / "images"
     input_dir.mkdir()
 

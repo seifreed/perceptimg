@@ -60,37 +60,53 @@ def build_candidate(
     """
     reasons: list[str] = []
 
+    # Determine lossless mode based on format and policy
     if fmt in LOSSLESS_FORMATS:
+        # PNG, TIFF, GIF, APNG are always lossless
         lossless = True
-        quality = None
+        final_quality = None
         progressive = False
     elif fmt == "jpeg":
+        # JPEG is always lossy
         if not policy.allow_lossy:
             return None
         lossless = False
         progressive = True
-        if quality is None:
-            quality = DEFAULT_QUALITIES[0]
-    elif not policy.allow_lossy and fmt in FORMATS_WITH_LOSSLESS_MODE:
-        lossless = True
-        quality = None
-        progressive = fmt in {"webp", "jxl"}
-    else:
-        if not policy.allow_lossy:
-            lossless = True
-            quality = None
-            progressive = False
-        else:
+        final_quality = quality if quality is not None else DEFAULT_QUALITIES[0]
+    elif fmt in FORMATS_WITH_LOSSLESS_MODE:
+        # WebP, AVIF, HEIF, JXL support both lossy and lossless modes
+        # Note: Progressive encoding is only enabled for WebP and JXL because
+        # Pillow's AVIF and HEIF encoders do not consistently support progressive
+        # encoding across different libavif/libheif versions. This may change in
+        # future Pillow versions as codec support improves.
+        if policy.allow_lossy:
             lossless = False
-            progressive = fmt in {"jpeg", "webp", "jxl"}
-            if quality is None:
-                quality = DEFAULT_QUALITIES[0]
+            progressive = fmt in {"webp", "jxl"}
+            final_quality = quality if quality is not None else DEFAULT_QUALITIES[0]
+        else:
+            lossless = True
+            final_quality = None
+            progressive = fmt in {"webp", "jxl"}
+    else:
+        # Unknown format - use defaults based on policy
+        lossless = not policy.allow_lossy
+        final_quality = (
+            None if lossless else (quality if quality is not None else DEFAULT_QUALITIES[0])
+        )
+        progressive = False
 
     if fmt == "webp" and lossless:
         reasons.append("webp_lossless")
 
     subsampling = (
-        0 if (analysis.probable_text or analysis.probable_faces or policy.preserve_faces or policy.preserve_text) else 2
+        0
+        if (
+            analysis.probable_text
+            or analysis.probable_faces
+            or policy.preserve_faces
+            or policy.preserve_text
+        )
+        else 2
     )
 
     if policy.preserve_text:
@@ -104,7 +120,7 @@ def build_candidate(
 
     return StrategyCandidate(
         format=fmt,
-        quality=quality,
+        quality=final_quality,
         subsampling=subsampling,
         progressive=progressive,
         lossless=lossless,
@@ -122,22 +138,55 @@ class StrategyGenerator:
 
     @staticmethod
     def _distributed_indices(count: int, target: int) -> list[int]:
-        """Pick indices across an ordered sequence while respecting a hard cap."""
+        """Return indices for selecting `target` items from `count` items.
+
+        Priority order: select across the ordered list to preserve preferred formats
+        while spreading selected indices for broader format coverage.
+
+        Args:
+            count: Total number of items in the sequence (must be > 0).
+            target: Desired number of indices to select (must be > 0).
+
+        Returns:
+            List of selected indices, at most min(count, target) items.
+        """
         if target >= count:
             return list(range(count))
-        if target == 1:
+        if target <= 1:
             return [0]
+        if target == 2:
+            return [0, count - 1]
 
-        indices: list[int] = []
-        last_idx = -1
-        for slot in range(target):
-            raw_idx = round(slot * (count - 1) / (target - 1))
-            min_allowed = last_idx + 1
-            max_allowed = count - (target - slot)
-            idx = max(min_allowed, min(raw_idx, max_allowed))
-            indices.append(idx)
-            last_idx = idx
-        return indices
+        # Preserve the first few priority formats, then spread the remainder.
+        keep_front = min(3, target)
+        selected: set[int] = set(range(keep_front))
+        remaining_slots = target - keep_front
+        if remaining_slots <= 0:
+            return [idx for idx in sorted(selected) if idx < count]
+
+        candidate_span = count - keep_front
+        if remaining_slots >= candidate_span:
+            return list(range(count))
+
+        if remaining_slots == 1:
+            selected.add(count - 1)
+            return sorted(selected)
+
+        step = (candidate_span - 1) / (remaining_slots - 1)
+        base = keep_front
+        for i in range(remaining_slots):
+            offset = round(i * step)
+            selected.add(base + min(candidate_span - 1, max(0, offset)))
+
+        if len(selected) < target:
+            for candidate in range(base + 1, count - 1):
+                if candidate in selected:
+                    continue
+                selected.add(candidate)
+                if len(selected) >= target:
+                    break
+
+        return sorted(selected)[:target]
 
     def generate(
         self,
@@ -154,7 +203,7 @@ class StrategyGenerator:
             raise StrategyError(f"Unsupported formats in preferred order: {sorted(unknown)}")
         if available_formats is not None:
             normalized_formats = {fmt.lower() for fmt in available_formats if fmt}
-            supported_formats = [fmt for fmt in formats if fmt in normalized_formats]
+            supported_formats = tuple(fmt for fmt in formats if fmt in normalized_formats)
             if supported_formats:
                 formats = supported_formats
         qualities = plan_qualities(policy, analysis)

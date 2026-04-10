@@ -183,6 +183,18 @@ class PILImageAdapter:
         return cls(pil_image)
 
 
+class PILImageIO:
+    """Simple image I/O adapter backed by PIL for default composition."""
+
+    def load_from_path(self, path: str | Path) -> PILImageAdapter:
+        """Load an image from disk."""
+        return PILImageAdapter.from_path(path)
+
+    def load_from_bytes(self, data: bytes) -> PILImageAdapter:
+        """Load an image from raw bytes."""
+        return PILImageAdapter.from_bytes(data)
+
+
 def load_image(path: str | Path) -> PILImageAdapter:
     """Load an image from a file path.
 

@@ -7,8 +7,6 @@ from collections.abc import Sequence
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from ...exceptions import ImageLoadError, OptimizationError
-from ...utils.image_io import load_image
 from ..optimizer import OptimizationResult, Optimizer
 from ..policy import Policy
 from .cache import AnalysisCache
@@ -50,7 +48,7 @@ class BatchProcessor:
         """
         try:
             if cache:
-                image = load_image(image_path)
+                image = self._optimizer.load_image(image_path)
                 cached_analysis = cache.get(image, image_path)
                 if cached_analysis:
                     result = self._optimizer.optimize_from_analysis(
@@ -65,7 +63,7 @@ class BatchProcessor:
             else:
                 result = self._optimizer.optimize(image_path, policy)
             return (image_path, result)
-        except (OptimizationError, ImageLoadError, OSError, ValueError) as exc:
+        except Exception as exc:
             return (image_path, exc)
 
     def execute(
@@ -101,30 +99,34 @@ class BatchProcessor:
         def process_with_hooks(image_path: Path) -> tuple[Path, OptimizationResult | Exception]:
             if hooks.rate_limiter:
                 if not hooks.rate_limiter.acquire():
+                    timeout_error = TimeoutError("Rate limiter acquire timed out")
                     result: tuple[Path, OptimizationResult | Exception] = (
                         image_path,
-                        TimeoutError("Rate limiter acquire timed out"),
+                        timeout_error,
                     )
                     if hooks.on_image_error:
-                        hooks.on_image_error(image_path, result[1])
+                        hooks.on_image_error(image_path, timeout_error)
                     return result
 
             if hooks.on_image_start:
                 hooks.on_image_start(image_path)
             result = self.process_single(image_path, config.policy, cache)
+            result_or_exc = result[1]
 
-            if isinstance(result[1], Exception):
+            if isinstance(result_or_exc, Exception):
                 if hooks.on_image_error:
-                    hooks.on_image_error(image_path, result[1])
+                    hooks.on_image_error(image_path, result_or_exc)
             else:
                 if hooks.on_image_complete:
-                    hooks.on_image_complete(image_path, result[1])
+                    hooks.on_image_complete(image_path, result_or_exc)
 
             return result
 
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            futures = {executor.submit(process_with_hooks, p): (index, p) for index, p in enumerate(paths)}
-            abort_requested = False
+            futures = {
+                executor.submit(process_with_hooks, p): (index, p) for index, p in enumerate(paths)
+            }
+            abort_requested = threading.Event()
 
             for future in as_completed(futures):
                 input_index, path = futures[future]
@@ -166,9 +168,16 @@ class BatchProcessor:
                     if hooks.on_checkpoint:
                         hooks.on_checkpoint()
 
-                if not config.continue_on_error and failed and not abort_requested:
-                    abort_requested = True
-                    executor.shutdown(wait=False, cancel_futures=True)
+                # Check for abort inside lock to avoid race condition with failed count
+                if not config.continue_on_error:
+                    should_abort = False
+                    with progress_lock:
+                        if progress.failed > 0 and not abort_requested.is_set():
+                            abort_requested.set()
+                            should_abort = True
+                    if should_abort:
+                        # Cancel pending futures but allow running ones to complete
+                        executor.shutdown(wait=False, cancel_futures=True)
 
         return BatchResult(
             successful=successful,

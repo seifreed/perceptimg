@@ -112,6 +112,9 @@ class RetryPolicy:
     ) -> RetryResult:
         """Execute an operation with retry logic.
 
+        Note: With max_retries=3 (default), there are 4 total attempts:
+        1 initial attempt + 3 retries. The loop runs max_retries + 1 times.
+
         Args:
             operation: Callable to execute.
             on_retry: Optional callback for retry events: (attempt, error, delay_ms).

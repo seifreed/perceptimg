@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal, cast
 
+
 class _UnsetType:
     """Sentinel to explicitly unset a field in merge().
 
@@ -36,7 +37,7 @@ class _UnsetType:
 
 UNSET = _UnsetType()
 
-_ALLOWED_FORMATS = {
+ALLOWED_FORMATS = {
     "jpeg",
     "png",
     "webp",
@@ -48,6 +49,7 @@ _ALLOWED_FORMATS = {
     "gif",
     "apng",
 }
+_ALLOWED_FORMATS = ALLOWED_FORMATS
 _TargetUseCase = Literal["web", "mobile", "print", "general"]
 
 
@@ -55,16 +57,23 @@ def _validate_formats(formats: Sequence[str] | None) -> tuple[str, ...] | None:
     if formats is None:
         return None
     normalized = tuple(fmt.lower() for fmt in formats)
-    unknown = set(normalized) - _ALLOWED_FORMATS
+    unknown = set(normalized) - ALLOWED_FORMATS
     if unknown:
         raise ValueError(f"Unsupported preferred_formats: {sorted(unknown)}")
     return normalized
 
 
-_POLICY_PUBLIC_FIELDS = frozenset({
-    "max_size_kb", "min_ssim", "preserve_text", "preserve_faces",
-    "allow_lossy", "preferred_formats", "target_use_case",
-})
+_POLICY_PUBLIC_FIELDS = frozenset(
+    {
+        "max_size_kb",
+        "min_ssim",
+        "preserve_text",
+        "preserve_faces",
+        "allow_lossy",
+        "preferred_formats",
+        "target_use_case",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,16 +90,14 @@ class Policy:
         target_use_case: Target channel (web, mobile, print, general).
     """
 
-    max_size_kb: int | None = None
+    max_size_kb: float | None = None
     min_ssim: float | None = None
     preserve_text: bool = False
     preserve_faces: bool = False
     allow_lossy: bool = True
     preferred_formats: tuple[str, ...] | None = field(default=None, repr=False)
     target_use_case: _TargetUseCase = "web"
-    _explicit_fields: frozenset[str] = field(
-        default=frozenset(), repr=False, compare=False
-    )
+    _explicit_fields: frozenset[str] = field(default=frozenset(), repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.max_size_kb is not None:
@@ -170,7 +177,7 @@ class Policy:
 
         if self.preferred_formats:
             return self.preferred_formats
-        return tuple(fmt for fmt in fallback if fmt in _ALLOWED_FORMATS)
+        return tuple(fmt for fmt in fallback if fmt in ALLOWED_FORMATS)
 
     def with_updates(self, **updates: object) -> Policy:
         """Return a new Policy with selected fields updated."""
@@ -206,17 +213,12 @@ class Policy:
         base = self.to_dict()
 
         if isinstance(other, Policy):
-            other_dict = {
-                k: v
-                for k, v in other.to_dict().items()
-                if k in other._explicit_fields
-            }
+            other_dict = {k: v for k, v in other.to_dict().items() if k in other._explicit_fields}
         else:
             other_dict = dict(other)
             other_dict.pop("_explicit_fields", None)
 
-        is_policy = isinstance(other, Policy)
-        override_data = {}
+        override_data: dict[str, object] = {}
         for k, v in other_dict.items():
             if isinstance(v, _UnsetType):
                 override_data[k] = None
@@ -231,9 +233,7 @@ class Policy:
 
 # Wrap __init__ to automatically track which fields were explicitly passed.
 _Policy_orig_init = Policy.__init__
-_POLICY_FIELD_NAMES = tuple(
-    f.name for f in fields(Policy) if f.name != "_explicit_fields"
-)
+_POLICY_FIELD_NAMES = tuple(f.name for f in fields(Policy) if f.name != "_explicit_fields")
 
 
 def _policy_init_wrapper(self, *args, **kwargs):  # type: ignore[no-untyped-def]

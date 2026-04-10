@@ -11,7 +11,8 @@ import pytest
 from PIL import Image
 
 from perceptimg import Policy
-from perceptimg.core.batch import (
+from perceptimg.application.batch import (
+    _batch_result_from_checkpoint,
     optimize_batch_with_checkpoint,
     optimize_batch_with_metrics,
     optimize_batch_with_rate_limit,
@@ -19,8 +20,8 @@ from perceptimg.core.batch import (
 )
 from perceptimg.core.batch.processor import BatchProcessor
 from perceptimg.core.checkpoint import CheckpointManager, JobResult, JobStatus
-from perceptimg.core.optimizer import OptimizationResult, Optimizer
 from perceptimg.core.metrics_exporter import MetricsCollector, PrometheusMetricsExporter
+from perceptimg.core.optimizer import OptimizationResult, Optimizer
 from perceptimg.core.rate_limiter import RateLimitConfig, RateLimiter
 from perceptimg.core.report import OptimizationReport
 from perceptimg.core.retry import RetryConfig, RetryPolicy
@@ -118,6 +119,57 @@ class TestCheckpointManager:
         assert manager._data.total == 3
         assert manager.get_pending() == [str(path) for path in images]
 
+    def test_manager_normalizes_path_keys(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        image = Path("nested") / "img.png"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        create_test_image(image)
+        checkpoint_path = tmp_path / "checkpoint.json"
+
+        manager = CheckpointManager(checkpoint_path)
+        manager.start([str((tmp_path / image).resolve())])
+        manager.mark_completed(
+            str(image.parent / "." / image.name),
+            JobResult(path=str(image), status=JobStatus.COMPLETED),
+        )
+        manager.save()
+
+        reloaded = CheckpointManager(checkpoint_path)
+        assert reloaded.load()
+        assert reloaded.get_pending_for([image]) == []
+        results = reloaded.get_results_for([str(image)])
+        assert len(results) == 1
+        assert results[0].status == JobStatus.COMPLETED
+
+    def test_batch_result_from_checkpoint_reconciles_missing_requested_inputs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        first = tmp_path / "img1.png"
+        missing = tmp_path / "img2.png"
+        create_test_image(first)
+        create_test_image(missing)
+
+        checkpoint_path = tmp_path / "checkpoint.json"
+        manager = CheckpointManager(checkpoint_path)
+        manager.start([first, missing])
+        manager.mark_completed(
+            str(first),
+            JobResult(path=str(first), status=JobStatus.COMPLETED),
+        )
+        manager.save()
+
+        reconstructed = _batch_result_from_checkpoint(manager, [missing])
+
+        assert len(reconstructed.successful) == 0
+        assert len(reconstructed.failed) == 1
+        assert reconstructed.failed_input_indices == [0]
+        assert reconstructed.failed[0][0] == missing
+
 
 class TestRetryPolicy:
     def test_success_no_retry(self) -> None:
@@ -195,7 +247,13 @@ class TestRateLimiter:
         assert limiter.try_acquire()
 
     def test_acquire_zero_timeout_is_non_blocking(self) -> None:
-        limiter = RateLimiter(RateLimitConfig(requests_per_second=1, burst_size=1, wait_timeout_ms=5000))
+        limiter = RateLimiter(
+            RateLimitConfig(
+                requests_per_second=1,
+                burst_size=1,
+                wait_timeout_ms=5000,
+            )
+        )
 
         assert limiter.acquire()
         start = time.monotonic()
@@ -308,6 +366,49 @@ class TestMetricsCollector:
 
 
 class TestBatchWithRetry:
+    def test_retry_aborts_on_non_retryable_after_transient_error(self, tmp_path: Path) -> None:
+        calls: dict[str, int] = {"bad.png": 0}
+        retry_events: list[tuple[int, float]] = []
+
+        def fake_process_single(
+            self: BatchProcessor,
+            image_path: Path,
+            policy: Policy,
+            cache: object = None,
+        ) -> tuple[Path, OptimizationResult | Exception]:
+            if image_path.name != "bad.png":
+                return (image_path, make_stub_result())
+            calls["bad.png"] += 1
+            if calls["bad.png"] == 1:
+                return (image_path, OSError("transient"))
+            return (image_path, ValueError("fatal"))
+
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
+            result = optimize_batch_with_retry(
+                [tmp_path / "bad.png"],
+                Policy(max_size_kb=500),
+                max_workers=1,
+                retry_config=RetryConfig(
+                    max_retries=3,
+                    base_delay_ms=0,
+                    jitter_ms=0,
+                ),
+                continue_on_error=False,
+                on_retry=lambda attempt, exc, delay_ms: retry_events.append((attempt, delay_ms)),
+            )
+
+        assert calls["bad.png"] == 2
+        assert len(retry_events) == 1
+        assert retry_events[0] == (1, 0)
+        assert len(result.successful) == 0
+        assert len(result.failed) == 1
+        assert result.failed_input_indices == [0]
+
     def test_success_with_retry(self, tmp_path: Path) -> None:
         for i in range(3):
             create_test_image(tmp_path / f"img{i}.png")
@@ -335,7 +436,12 @@ class TestBatchWithRetry:
             time.sleep(0.05)
             return (image_path, ok_result)
 
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             result = optimize_batch_with_retry(
                 [Path("good1.png"), Path("bad.png"), Path("good2.png")],
                 Policy(max_size_kb=500),
@@ -363,7 +469,12 @@ class TestBatchWithRetry:
                 time.sleep(0.01)
             return (image_path, ok_result)
 
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             optimize_batch_with_retry(
                 [Path("slow.png"), Path("fast.png")],
                 Policy(max_size_kb=500),
@@ -419,7 +530,12 @@ class TestBatchWithRateLimit:
             time.sleep(0.05)
             return (image_path, ok_result)
 
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             result = optimize_batch_with_rate_limit(
                 [Path("good1.png"), Path("bad.png"), Path("good2.png")],
                 Policy(max_size_kb=500),
@@ -444,8 +560,18 @@ class TestBatchWithRateLimit:
             return (image_path, make_stub_result())
 
         with (
-            patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single),
-            patch.object(RateLimiter, "acquire", autospec=True, return_value=False),
+            patch.object(
+                BatchProcessor,
+                "process_single",
+                autospec=True,
+                side_effect=fake_process_single,
+            ),
+            patch.object(
+                RateLimiter,
+                "acquire",
+                autospec=True,
+                return_value=False,
+            ),
         ):
             result = optimize_batch_with_rate_limit(
                 [Path("a.png")],
@@ -487,7 +613,12 @@ class TestBatchWithMetrics:
             time.sleep(0.01)
             return (image_path, ok_result)
 
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             result, metrics = optimize_batch_with_metrics(
                 [Path("a.png"), Path("b.png")],
                 Policy(max_size_kb=500),
@@ -511,7 +642,12 @@ class TestBatchWithMetrics:
             return (image_path, ok_result)
 
         duplicate = Path("dup.png")
-        with patch.object(BatchProcessor, "process_single", autospec=True, side_effect=fake_process_single):
+        with patch.object(
+            BatchProcessor,
+            "process_single",
+            autospec=True,
+            side_effect=fake_process_single,
+        ):
             result, metrics = optimize_batch_with_metrics(
                 [duplicate, duplicate],
                 Policy(max_size_kb=500),
@@ -549,7 +685,7 @@ class TestBatchWithCheckpoint:
 
         result = optimize_batch_with_checkpoint(paths, policy, checkpoint_path)
 
-        with patch("perceptimg.core.batch.__init__.BatchProcessor.execute") as mocked_execute:
+        with patch("perceptimg.application.batch.BatchProcessor.execute") as mocked_execute:
             result2 = optimize_batch_with_checkpoint(paths, policy, checkpoint_path)
             mocked_execute.assert_not_called()
 
@@ -589,7 +725,7 @@ class TestBatchWithCheckpoint:
 
         optimize_batch_with_checkpoint([first, second], policy, checkpoint_path)
 
-        with patch("perceptimg.core.batch.__init__.BatchProcessor.execute") as mocked_execute:
+        with patch("perceptimg.application.batch.BatchProcessor.execute") as mocked_execute:
             subset = optimize_batch_with_checkpoint([first], policy, checkpoint_path)
             mocked_execute.assert_not_called()
 
@@ -628,7 +764,7 @@ class TestBatchWithCheckpoint:
         )
         manager.save()
 
-        with patch("perceptimg.core.batch.__init__.BatchProcessor.execute") as mocked_execute:
+        with patch("perceptimg.application.batch.BatchProcessor.execute") as mocked_execute:
             resumed = optimize_batch_with_checkpoint([image], policy, checkpoint_path)
             mocked_execute.assert_not_called()
 
@@ -676,14 +812,14 @@ class TestBatchWithCheckpoint:
         )
         manager.save()
 
-        with patch("perceptimg.core.batch.__init__.BatchProcessor.execute") as mocked_execute:
+        with patch("perceptimg.application.batch.BatchProcessor.execute") as mocked_execute:
             resumed = optimize_batch_with_checkpoint(
                 [skipped, completed, failed], policy, checkpoint_path
             )
             mocked_execute.assert_not_called()
 
         assert resumed.total == 3
-        assert [path for path in resumed.skipped] == [skipped]
+        assert list(resumed.skipped) == [skipped]
         assert [path.name for path, _ in resumed.successful] == ["completed.png"]
         assert [path.name for path, _ in resumed.failed] == ["failed.png"]
 
@@ -753,7 +889,7 @@ class TestBatchWithCheckpoint:
         )
         manager.save()
 
-        with patch("perceptimg.core.batch.__init__.BatchProcessor.execute") as mocked_execute:
+        with patch("perceptimg.application.batch.BatchProcessor.execute") as mocked_execute:
             subset = optimize_batch_with_checkpoint([first], policy, checkpoint_path)
             mocked_execute.assert_not_called()
 

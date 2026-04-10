@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -12,6 +13,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class JobStatus(StrEnum):
@@ -218,6 +221,9 @@ class RedisJobQueue:
             self._apply_result_ttl(redis, self._completed_key())
         elif status == JobStatus.FAILED:
             redis.rpush(self._failed_key(), job_id)
+        elif status == JobStatus.CANCELLED:
+            # Cancelled jobs are removed from all lists but not tracked separately
+            pass
 
     def _persist_terminal_job(self, redis: Any, job: Job) -> None:
         terminal_key = self._terminal_job_key(job.id)
@@ -251,6 +257,11 @@ class RedisJobQueue:
             keys_fn = getattr(redis, "keys", None)
             if callable(keys_fn):
                 keys.extend(keys_fn(self._terminal_keys_pattern()))
+            else:
+                logger.warning(
+                    "Redis client does not support scan_iter or keys method; "
+                    "terminal job counts may be incomplete"
+                )
 
         prefix = self._terminal_job_key("")
         job_ids: list[str] = []
@@ -269,15 +280,19 @@ class RedisJobQueue:
         action: str,
         error: str | None = None,
     ) -> None:
-        message = f"Invalid state transition: {action} from {job.status.value}"
+        # Preserve diagnostic information in error message
+        worker_info = (
+            f" (worker={job.worker_id}, attempt={job.attempt_id})" if job.worker_id else ""
+        )
+        message = f"Invalid state transition: {action} from {job.status.value}{worker_info}"
         if error:
             message = f"{message}: {error}"
 
         job.status = JobStatus.FAILED
         job.completed_at = datetime.now(UTC).isoformat()
+        # Preserve worker_id and attempt_id in the job for debugging
+        # Clear started_at since the job didn't complete normally
         job.started_at = ""
-        job.worker_id = ""
-        job.attempt_id = ""
         job.result = None
         job.error = message
 
@@ -376,7 +391,7 @@ class RedisJobQueue:
         now = datetime.now(UTC).isoformat()
 
         for path in image_paths:
-            job_id = f"{job_id_prefix or ''}{uuid.uuid4().hex[:12]}"
+            job_id = f"{job_id_prefix or ''}{uuid.uuid4().hex[:16]}"
             job = Job(
                 id=job_id,
                 image_path=path,
@@ -411,9 +426,6 @@ class RedisJobQueue:
                 job_id = redis.lpop(self._pending_key())
                 if job_id is None:
                     return None
-                if stale_count >= max_stale_pops:
-                    redis.lpush(self._pending_key(), job_id)
-                    return None
                 result = (self._pending_key(), job_id)
             elif timeout == -1:
                 result = redis.blpop(self._pending_key(), timeout=0)
@@ -435,27 +447,33 @@ class RedisJobQueue:
             _, job_id = result
             job = self._load_live_job(redis, job_id)
             if job is None:
+                # Check if job exists in terminal storage (already completed/failed)
                 if self._load_terminal_job(redis, job_id) is not None:
-                    stale_count += 1
+                    # Job exists but is terminal - not really stale, just skip it
                     continue
+                # Job metadata is truly missing - this is stale
                 self._record_missing_job_metadata(redis, job_id)
                 stale_count += 1
+                if stale_count >= max_stale_pops:
+                    return None
                 continue
 
             if job.status != JobStatus.QUEUED:
                 if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
                     self._migrate_stale_live_terminal(redis, job)
-                    stale_count += 1
+                    # Terminal jobs in pending queue are not stale - just skip them
                     continue
                 redis.lrem(self._pending_key(), 0, job_id)
                 stale_count += 1
+                if stale_count >= max_stale_pops:
+                    return None
                 continue
 
             job.status = JobStatus.PROCESSING
             job.started_at = datetime.now(UTC).isoformat()
             job.completed_at = ""
             job.worker_id = worker_id
-            job.attempt_id = uuid.uuid4().hex[:12]
+            job.attempt_id = uuid.uuid4().hex[:16]
             job.result = None
             job.error = None
 
@@ -469,10 +487,14 @@ class RedisJobQueue:
                     if watched_job is None or watched_job.status != JobStatus.QUEUED:
                         pipe.reset()
                         stale_count += 1
+                        if stale_count >= max_stale_pops:
+                            return None
                         continue
                 else:
                     pipe.reset()
                     stale_count += 1
+                    if stale_count >= max_stale_pops:
+                        return None
                     continue
                 pipe.multi()
                 pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
@@ -482,6 +504,8 @@ class RedisJobQueue:
                 if "WatchError" in type(exc).__name__:
                     # Another worker modified the job concurrently — retry
                     stale_count += 1
+                    if stale_count >= max_stale_pops:
+                        return None
                     continue
                 raise
 
@@ -505,26 +529,41 @@ class RedisJobQueue:
         """
         redis = self._get_redis()
 
-        job = self._load_job(redis, job_id)
-        if job is None:
-            return
+        try:
+            pipe = redis.pipeline(True)
+            pipe.watch(self._jobs_key())
 
-        if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
-            return
-        if job.worker_id != worker_id:
-            return
-        if job.attempt_id != attempt_id:
-            return
-        if job.status != JobStatus.PROCESSING:
-            self._mark_invalid_live_transition(redis, job, action="complete")
-            return
+            job_data = pipe.hget(self._jobs_key(), job_id)
+            if not job_data:
+                return
 
-        job.status = JobStatus.COMPLETED
-        job.completed_at = datetime.now(UTC).isoformat()
-        job.worker_id = ""
-        job.attempt_id = ""
-        job.error = None
-        job.result = result
+            job = Job.from_dict(json.loads(job_data))
+
+            if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+                pipe.reset()
+                return
+            if job.worker_id != worker_id or job.attempt_id != attempt_id:
+                pipe.reset()
+                return
+            if job.status != JobStatus.PROCESSING:
+                pipe.reset()
+                self._mark_invalid_live_transition(redis, job, action="complete")
+                return
+
+            job.status = JobStatus.COMPLETED
+            job.completed_at = datetime.now(UTC).isoformat()
+            job.worker_id = ""
+            job.attempt_id = ""
+            job.error = None
+            job.result = result
+
+            pipe.multi()
+            pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
+            pipe.execute()
+        except Exception as exc:
+            if "WatchError" in type(exc).__name__:
+                return
+            raise
 
         self._persist_terminal_job(redis, job)
 
@@ -548,43 +587,56 @@ class RedisJobQueue:
         """
         redis = self._get_redis()
 
-        job = self._load_job(redis, job_id)
-        if job is None:
-            return
+        try:
+            pipe = redis.pipeline(True)
+            pipe.watch(self._jobs_key())
 
-        if job.status in {JobStatus.FAILED, JobStatus.COMPLETED}:
-            return
-        if job.worker_id != worker_id:
-            return
-        if job.attempt_id != attempt_id:
-            return
-        if job.status != JobStatus.PROCESSING:
-            self._mark_invalid_live_transition(redis, job, action="fail", error=error)
-            return
+            job_data = pipe.hget(self._jobs_key(), job_id)
+            if not job_data:
+                return
 
-        job.retries += 1
-        job.error = error
-        self._remove_job_from_lists(redis, job_id)
+            job = Job.from_dict(json.loads(job_data))
 
-        if retry and job.retries < self.config.max_retries:
-            job.status = JobStatus.QUEUED
-            job.started_at = ""
-            job.completed_at = ""
-            job.worker_id = ""
-            job.attempt_id = ""
-            job.result = None
-            pipe = redis.pipeline()
-            pipe.rpush(self._pending_key(), job_id)
-            pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
-            pipe.hdel(self._processing_key(), job_id)
-            pipe.execute()
-        else:
-            job.status = JobStatus.FAILED
-            job.completed_at = datetime.now(UTC).isoformat()
-            job.worker_id = ""
-            job.attempt_id = ""
-            job.result = None
-            self._persist_terminal_job(redis, job)
+            if job.status in {JobStatus.FAILED, JobStatus.COMPLETED}:
+                pipe.reset()
+                return
+            if job.worker_id != worker_id or job.attempt_id != attempt_id:
+                pipe.reset()
+                return
+            if job.status != JobStatus.PROCESSING:
+                pipe.reset()
+                self._mark_invalid_live_transition(redis, job, action="fail", error=error)
+                return
+
+            job.retries += 1
+            job.error = error
+
+            if retry and job.retries < self.config.max_retries:
+                job.status = JobStatus.QUEUED
+                job.started_at = ""
+                job.completed_at = ""
+                job.worker_id = ""
+                job.attempt_id = ""
+                job.result = None
+
+                pipe.multi()
+                pipe.rpush(self._pending_key(), job_id)
+                pipe.hset(self._jobs_key(), job_id, json.dumps(job.to_dict()))
+                pipe.hdel(self._processing_key(), job_id)
+                pipe.execute()
+            else:
+                pipe.reset()
+                job.status = JobStatus.FAILED
+                job.completed_at = datetime.now(UTC).isoformat()
+                job.worker_id = ""
+                job.attempt_id = ""
+                job.result = None
+                self._persist_terminal_job(redis, job)
+
+        except Exception as exc:
+            if "WatchError" in type(exc).__name__:
+                return
+            raise
 
     def get_status(self, job_id: str) -> Job | None:
         """Get job status.
@@ -618,20 +670,41 @@ class RedisJobQueue:
     def clear(self) -> None:
         """Clear all jobs from the queue."""
         redis = self._get_redis()
-        terminal_ids = set(redis.lrange(self._completed_key(), 0, -1))
-        terminal_ids.update(redis.lrange(self._failed_key(), 0, -1))
-        terminal_keys = {self._terminal_job_key(job_id) for job_id in terminal_ids}
+        terminal_ids: set[str] = set()
 
+        # Get IDs from lists (decode bytes defensively)
+        for job_id in redis.lrange(self._completed_key(), 0, -1):
+            if isinstance(job_id, bytes):
+                job_id = job_id.decode()
+            terminal_ids.add(job_id)
+
+        for job_id in redis.lrange(self._failed_key(), 0, -1):
+            if isinstance(job_id, bytes):
+                job_id = job_id.decode()
+            terminal_ids.add(job_id)
+
+        terminal_keys: set[str] = {self._terminal_job_key(job_id) for job_id in terminal_ids}
+
+        # Get keys from scan/keys (decode bytes defensively)
         scan_iter = getattr(redis, "scan_iter", None)
         if callable(scan_iter):
             try:
-                terminal_keys.update(scan_iter(match=self._terminal_keys_pattern()))
+                for key in scan_iter(match=self._terminal_keys_pattern()):
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    terminal_keys.add(key)
             except TypeError:
-                terminal_keys.update(scan_iter(self._terminal_keys_pattern()))
+                for key in scan_iter(self._terminal_keys_pattern()):
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    terminal_keys.add(key)
         else:
             keys = getattr(redis, "keys", None)
             if callable(keys):
-                terminal_keys.update(keys(self._terminal_keys_pattern()))
+                for key in keys(self._terminal_keys_pattern()):
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    terminal_keys.add(key)
 
         for key in terminal_keys:
             redis.delete(key)
@@ -697,7 +770,9 @@ class Worker:
             except Exception as e:
                 _permanent = (FileNotFoundError, PermissionError, ValueError, TypeError)
                 retryable = not isinstance(e, _permanent)
-                self.queue.fail(job.id, self.worker_id, str(e), retry=retryable, attempt_id=job.attempt_id)
+                self.queue.fail(
+                    job.id, self.worker_id, str(e), retry=retryable, attempt_id=job.attempt_id
+                )
 
     def stop(self) -> None:
         """Stop processing jobs."""
@@ -715,7 +790,7 @@ def create_worker_process(
     Returns:
         Worker instance ready to process jobs.
     """
-    from perceptimg import Policy
+    from .policy import Policy
 
     def process_image(image_path: str, policy_dict: dict[str, Any]) -> dict[str, Any]:
         from perceptimg.core.optimizer import Optimizer
