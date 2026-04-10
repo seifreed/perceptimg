@@ -68,6 +68,23 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
+## Releases
+
+Releases are created from version tags and are published by `.github/workflows/release.yml`.
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+The release workflow:
+
+- builds the wheel and sdist from the tagged commit,
+- publishes to PyPI with Trusted Publishing / OIDC,
+- attaches the built artifacts to the GitHub Release.
+
+Before the first publish, add a PyPI trusted publisher for this repository using the workflow file `release.yml` and the GitHub environment `pypi`. The tag version must match `project.version` in `pyproject.toml`.
+
 ---
 
 ## Quick Start
